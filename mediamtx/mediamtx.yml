@@ -1,0 +1,42 @@
+# ==========================================================================
+# MediaMTX Configuration — RTSP Proxy for Face Surveillance
+# ==========================================================================
+# MediaMTX receives RTSP streams from cameras and provides stable,
+# re-streamable endpoints for the backend detection engine.
+#
+# Architecture: Camera (RTSP) → MediaMTX → Backend (detection) → Frontend
+# ==========================================================================
+
+# ---- Logging ----
+logLevel: warn
+logDestinations: [stdout]
+
+# ---- Protocol ports ----
+# RTSP
+rtspAddress: :8554
+# RTMP
+rtmpAddress: :1935
+# HLS
+hlsAddress: :8888
+# WebRTC (disabled — not needed)
+webrtcAddress: ""
+
+# ---- API ----
+api: yes
+apiAddress: :9997
+
+# ---- Default path settings ----
+# "all" is a catch-all that applies to every path not explicitly defined.
+# Any RTSP publisher can push to rtsp://mediamtx:8554/<path_name>
+# and readers can pull from the same URL.
+paths:
+  all:
+    source: publisher
+    # No authentication for reads (internal network only)
+    readUser: ""
+    readPass: ""
+    # No authentication for publishes
+    publishUser: ""
+    publishPass: ""
+    # Record settings (disabled)
+    record: no
