@@ -31,3 +31,7 @@ snapshots/
 
 # Docker
 *.log
+
+# Mengabaikan file executable MediaMTX
+mediamtx/mediamtx.exe
+mediamtx.log
