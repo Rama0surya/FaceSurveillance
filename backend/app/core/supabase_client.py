@@ -9,21 +9,27 @@ from datetime import datetime
 from supabase import create_client, Client
 
 from app.core.config import settings
+from threading import Lock
 
+_supabase_client: Client | None = None
+_lock = Lock()  # ← add this
 # ---------------------------------------------------------------------------
 # Singleton client
 # ---------------------------------------------------------------------------
-_supabase_client: Client | None = None
-
-
 def get_supabase() -> Client:
-    """Return (and lazily initialise) the Supabase client."""
     global _supabase_client
     if _supabase_client is None:
-        _supabase_client = create_client(
-            settings.SUPABASE_URL,
-            settings.SUPABASE_API_KEY,
-        )
+        with _lock:
+            if _supabase_client is None:
+                # Temporary debug — remove after confirming
+                print(f"[DEBUG] URL: {settings.SUPABASE_URL}")
+                print(f"[DEBUG] KEY prefix: {settings.SUPABASE_SERVICE_ROLE_KEY[:20]}")
+                print(f"[DEBUG] KEY type: {type(settings.SUPABASE_SERVICE_ROLE_KEY)}")
+                
+                _supabase_client = create_client(
+                    settings.SUPABASE_URL,
+                    settings.SUPABASE_SERVICE_ROLE_KEY,
+                )
     return _supabase_client
 
 

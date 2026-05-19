@@ -57,7 +57,11 @@ class MediaMTXClient:
     # ------------------------------------------------------------------
 
     async def add_path(self, name: str, source: str) -> bool:
-        """Add a new path that proxies to an RTSP source.
+        """Upsert a path that proxies to an RTSP source.
+
+        If the path already exists in MediaMTX (e.g. defined in the static
+        config), the add is skipped gracefully — the existing stream keeps
+        running untouched.
 
         Args:
             name: Path name (e.g. ``cam1``). Will be accessible at
@@ -65,21 +69,40 @@ class MediaMTXClient:
             source: Original RTSP URL of the camera.
 
         Returns:
-            ``True`` if the path was created successfully.
+            ``True`` if the path is available (created or already existed).
         """
         async with httpx.AsyncClient(timeout=5) as client:
+            # Check if path already exists (static config or previously added)
+            check = await client.get(f"{self.base_url}/v3/config/paths/get/{name}")
+            if check.status_code == 200:
+                logger.info(
+                    "MediaMTX path '%s' already exists, skipping add", name
+                )
+                return True
+
+            # Path not found — create it dynamically
             r = await client.post(
                 f"{self.base_url}/v3/config/paths/add/{name}",
-                json={"source": source},
+                json={
+                    "source": source,
+                    "rtspTransport": "tcp",
+                    "sourceOnDemand": False,
+                },
             )
             if r.status_code == 200:
                 logger.info("MediaMTX path '%s' added → source=%s", name, source)
                 return True
+
+            # 400 "path already exists" — race condition between check and add,
+            # treat as success since the path is available.
+            if r.status_code == 400 and "already exists" in r.text:
+                logger.info(
+                    "MediaMTX path '%s' already exists (race), skipping", name
+                )
+                return True
+
             logger.warning(
-                "MediaMTX add_path '%s' failed: %s %s",
-                name,
-                r.status_code,
-                r.text,
+                "MediaMTX add_path '%s' failed: %s %s", name, r.status_code, r.text
             )
             return False
 
@@ -90,26 +113,31 @@ class MediaMTXClient:
             ``True`` if the path was updated successfully.
         """
         async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.post(
+            r = await client.patch(
                 f"{self.base_url}/v3/config/paths/edit/{name}",
-                json={"source": source},
+                json={
+                    "source": source,
+                    "rtspTransport": "tcp",
+                    "sourceOnDemand": False,
+                },
             )
             if r.status_code == 200:
                 logger.info("MediaMTX path '%s' updated → source=%s", name, source)
                 return True
             logger.warning(
-                "MediaMTX edit_path '%s' failed: %s %s",
-                name,
-                r.status_code,
-                r.text,
+                "MediaMTX edit_path '%s' failed: %s %s", name, r.status_code, r.text
             )
             return False
 
     async def remove_path(self, name: str) -> bool:
-        """Remove a path from MediaMTX configuration.
+        """Remove a dynamically-added path from MediaMTX.
+
+        Paths defined in the static mediamtx.yml cannot be removed via the
+        API — a 404 here is expected and logged at DEBUG level only.
 
         Returns:
-            ``True`` if the path was removed successfully.
+            ``True`` if the path was removed, ``False`` if it did not exist
+            or could not be removed.
         """
         async with httpx.AsyncClient(timeout=5) as client:
             r = await client.post(
@@ -118,11 +146,16 @@ class MediaMTXClient:
             if r.status_code == 200:
                 logger.info("MediaMTX path '%s' removed", name)
                 return True
+
+            if r.status_code == 404:
+                # Path is defined in static config — nothing to remove dynamically
+                logger.debug(
+                    "MediaMTX path '%s' not in dynamic config, skipping remove", name
+                )
+                return False
+
             logger.warning(
-                "MediaMTX remove_path '%s' failed: %s %s",
-                name,
-                r.status_code,
-                r.text,
+                "MediaMTX remove_path '%s' failed: %s %s", name, r.status_code, r.text
             )
             return False
 

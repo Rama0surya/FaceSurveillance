@@ -167,7 +167,13 @@ export default function AnalyticsPage() {
 
       // Fetch detections
       const dParams = new URLSearchParams(params);
-      dParams.set('limit', '200');
+      // dParams.set('limit', '200');
+      if (selectedCamera !== 'all') dParams.set('camera_id', selectedCamera);
+
+      // Convert YYYY-MM-DD to ISO timestamps that FastAPI/Pydantic expects
+      dParams.set('start', `${startDate}T00:00:00`);
+      dParams.set('end', `${endDate}T23:59:59`);
+      dParams.set('limit', '100'); // Lowered from 200 to protect query constraints
       const dRes = await fetch(`${API_BASE}/api/snapshots?${dParams}`);
       if (dRes.ok) {
         const dJson = await dRes.json();
@@ -183,6 +189,9 @@ export default function AnalyticsPage() {
             snapshot_url: s.url ?? '',
           })),
         );
+      } else {
+        // If the backend returns a 422 or 500, throw so the catch block triggers mock data
+        throw new Error('Snapshots API validation failed');
       }
     } catch {
       // Fallback to mock data

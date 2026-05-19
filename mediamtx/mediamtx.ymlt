@@ -1,0 +1,41 @@
+# ==========================================================================
+# MediaMTX Configuration — RTSP Proxy for Face Surveillance
+# ==========================================================================
+
+logLevel: warn
+logDestinations: [stdout]
+
+# Timeouts
+readTimeout: 10s
+writeTimeout: 10s
+
+# RTSP server
+rtsp: true
+rtspAddress: :8554
+rtspTransports: [tcp]        # force TCP only, skip UDP negotiation entirely
+
+# RTMP (disable jika tidak dipakai)
+rtmp: false
+
+# HLS
+hls: true
+hlsAddress: :8888
+
+# WebRTC (disable)
+webrtc: false
+
+# SRT (disable)
+srt: false
+
+# Control API
+api: true
+apiAddress: :9997
+
+# ==========================================================================
+# Path settings
+# ==========================================================================
+paths:
+
+  all_others:
+    source: publisher
+    record: false

@@ -46,7 +46,7 @@ def get_camera(camera_id: str) -> Optional[CameraResponse]:
         .maybe_single()
         .execute()
     )
-    if result.data is None:
+    if result is None or result.data is None:
         return None
     return CameraResponse(**result.data)
 
@@ -92,4 +92,4 @@ def get_camera_raw(camera_id: str) -> Optional[dict]:
         .maybe_single()
         .execute()
     )
-    return result.data
+    return result.data if result else None

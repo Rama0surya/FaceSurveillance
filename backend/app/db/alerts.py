@@ -71,7 +71,7 @@ def get_alert_rule(rule_id: str) -> Optional[dict]:
             .maybe_single()
             .execute()
         )
-        return result.data
+        return result.data if result else None
     except Exception:
         logger.exception("Failed to fetch alert rule %s", rule_id)
         return None
@@ -184,7 +184,7 @@ def get_alert(alert_id: str) -> Optional[dict]:
             .maybe_single()
             .execute()
         )
-        return result.data
+        return result.data if result else None
     except Exception:
         logger.exception("Failed to fetch alert %s", alert_id)
         return None

@@ -5,7 +5,7 @@
  *   3. Alert Rules (CRUD)
  */
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, Fragment } from 'react';
 import {
   Bell, CheckCheck, AlertTriangle, Info, ShieldAlert,
   Plus, Pencil, Trash2, X, ChevronLeft, ChevronRight,
@@ -245,7 +245,7 @@ function AlertHistoryTab() {
               <tr><td colSpan={7} className="alerts-table__empty">No alerts found</td></tr>
             )}
             {data.map((a) => (
-              <>
+              <Fragment key={a.id}>
                 <tr key={a.id} className={`alerts-table__row ${!a.is_read ? 'alerts-table__row--unread' : ''}`} onClick={() => setExpanded(expanded === a.id ? null : a.id)}>
                   <td>{severityIcon(a.severity)} <span className={`alerts-severity-badge alerts-severity-badge--${a.severity}`}>{severityLabel(a.severity)}</span></td>
                   <td>{a.alert_type}</td>
@@ -270,7 +270,7 @@ function AlertHistoryTab() {
                     </td>
                   </tr>
                 )}
-              </>
+              </Fragment>
             ))}
           </tbody>
         </table>

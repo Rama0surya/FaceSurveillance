@@ -77,7 +77,7 @@ function App() {
         },
       ];
       setCameras(mockCameras);
-      setActiveCamera(mockCameras[0]);
+      // setActiveCamera(mockCameras[0]);
     }
   }
 
@@ -86,6 +86,7 @@ function App() {
    */
   const fetchDashboardData = useCallback(
     async (cameraId: string) => {
+      if (cameraId.startsWith('cam-00')) return;
       const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
       // Fetch today stats

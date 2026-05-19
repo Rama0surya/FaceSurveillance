@@ -114,7 +114,7 @@ class ModelManager:
         try:
             from ultralytics import YOLO
 
-            model_path = getattr(settings, "YOLO_MODEL_PATH", "yolov8n-face.pt")
+            model_path = getattr(settings, "YOLO_MODEL_PATH", "yolov8n-face-lindevs.pt")
             self.yolo_model = YOLO(model_path)
 
             if self.device == "cuda":
@@ -188,7 +188,7 @@ class ModelManager:
         try:
             from ultralytics import YOLO
 
-            model_path = getattr(settings, "YOLO_MODEL_PATH", "yolov8n-face.pt")
+            model_path = getattr(settings, "YOLO_MODEL_PATH", "yolov8n-face-lindevs.pt")
             tracker = YOLO(model_path)
 
             if self.device == "cuda":

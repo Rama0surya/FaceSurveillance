@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # Supabase
     SUPABASE_URL: str
     SUPABASE_API_KEY: str
+    SUPABASE_SERVICE_ROLE_KEY: str
     SUPABASE_STORAGE_BUCKET: str = "snapshots"
 
     # DeepFace (retained for emotion analysis)
@@ -37,7 +38,7 @@ class Settings(BaseSettings):
     FACE_DETECTOR: str = "yolov8"       # "yolov8" | "deepface_legacy"
     FACE_TRACKER: str = "bytetrack"     # "bytetrack" | "botsort" | "none"
     YOLO_CONFIDENCE: float = 0.5
-    YOLO_MODEL_PATH: str = "yolov8n-face.pt"
+    YOLO_MODEL_PATH: str = "yolov8n-face-lindevs.pt"
     INSIGHT_MODEL: str = "buffalo_l"
     USE_GPU: str = "auto"               # "auto" | "cuda" | "cpu"
     TRACK_REANALYZE_TTL: int = 300      # seconds before re-analyzing a tracked face

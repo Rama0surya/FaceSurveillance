@@ -112,15 +112,16 @@ async def health_check():
     # Check Supabase connectivity
     supabase_ok = False
     try:
-        from app.db.detections import _sb
+        from app.core.supabase_client import get_supabase
 
         # Simple ping — attempt to read from a table
-        _sb.table("detections").select("id").limit(1).execute()
+        client = get_supabase()
+        client.table("detections").select("id").limit(1).execute()
         supabase_ok = True
     except Exception:
         pass
 
-    active_streams = len(detection_engine.active_cameras)
+    active_streams = len(detection_engine._workers)
 
     return {
         "api_status": "healthy",

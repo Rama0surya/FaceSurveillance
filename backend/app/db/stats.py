@@ -45,7 +45,8 @@ def upsert_hourly_stats(
         .execute()
     )
 
-    if result.data:
+    # if result.data:
+    if result and hasattr(result, 'data') and result.data:
         # Update existing row
         row = result.data
         emotions: dict = row.get("emotions") or {}

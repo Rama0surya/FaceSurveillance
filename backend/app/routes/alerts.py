@@ -85,13 +85,18 @@ async def api_list_alerts(
     offset: int = Query(0, ge=0),
 ):
     """List alerts with optional filters and pagination."""
-    return get_alerts(
+    alerts = get_alerts(
         camera_id=camera_id,
         severity=severity,
         is_read=is_read,
         limit=limit,
         offset=offset,
     )
+    # Frontend expects { data: [...], count: int }
+    return {
+        "data": alerts,
+        "count": len(alerts),
+    }
 
 
 @router.get("/unread-count")

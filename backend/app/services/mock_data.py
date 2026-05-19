@@ -200,7 +200,7 @@ def generate_mock_data(
             .execute()
         )
 
-        if existing_row.data:
+        if existing_row and existing_row.data:
             # Merge with existing
             row = existing_row.data
             emotions = row.get("emotions") or {}
