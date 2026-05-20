@@ -106,18 +106,27 @@ async def update_detection_config(body: DetectionConfigUpdate):
 
 @router.get("/health")
 async def health_check():
-    """Return system health: API status, DB connectivity, active streams, uptime."""
+    """Return system health: API status, Supabase connectivity, active streams, uptime."""
     from app.services.detection import detection_engine
-    from app.core.db_client import ping_db
 
-    db_ok = ping_db()
+    # Check Supabase connectivity
+    supabase_ok = False
+    try:
+        from app.core.supabase_client import get_supabase
+
+        # Simple ping — attempt to read from a table
+        client = get_supabase()
+        client.table("detections").select("id").limit(1).execute()
+        supabase_ok = True
+    except Exception:
+        pass
+
     active_streams = len(detection_engine._workers)
 
     return {
         "api_status": "healthy",
-        "db_connected": db_ok,
+        "supabase_connected": supabase_ok,
         "active_streams": active_streams,
         "uptime_seconds": SystemInfo.get_uptime_seconds(),
         "version": "1.0.0",
     }
-

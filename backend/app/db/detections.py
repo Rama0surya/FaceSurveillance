@@ -1,201 +1,135 @@
-"""
-CRUD operations for the ``detections`` and ``snapshots`` tables.
-"""
-
 from __future__ import annotations
-
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
-
-from app.core.supabase_client import get_supabase
-
-DETECTIONS_TABLE = "detections"
-SNAPSHOTS_TABLE = "snapshots"
+from sqlalchemy import text
+from app.core.db_client import get_db
 
 
-def insert_detection(
-    camera_id: str,
-    faces_data: list[dict],
-    timestamp: Optional[str] = None,
-) -> str:
-    """
-    Insert a detection record with its faces payload.
-
-    Returns the new detection ``id``.
-    """
-    client = get_supabase()
-    detection_id = str(uuid.uuid4())
-    ts = timestamp or datetime.now(timezone.utc).isoformat()
-
-    row = {
-        "id": detection_id,
-        "camera_id": camera_id,
-        "timestamp": ts,
-        "faces": faces_data,
-    }
-    client.table(DETECTIONS_TABLE).insert(row).execute()
-    return detection_id
+def insert_detection(camera_id: str, faces_data: list[dict], timestamp: Optional[str] = None) -> str:
+    db = get_db()
+    try:
+        did = str(uuid.uuid4())
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
+        db.execute(text("""
+            INSERT INTO detections (id, camera_id, timestamp, faces)
+            VALUES (:id, :camera_id, :timestamp, :faces)
+        """), {"id": did, "camera_id": camera_id, "timestamp": ts, "faces": json.dumps(faces_data)})
+        db.commit()
+        return did
+    except Exception:
+        db.rollback(); raise
+    finally:
+        db.close()
 
 
-def insert_snapshot(
-    camera_id: str,
-    detection_id: str,
-    url: str,
-) -> str:
-    """Insert a snapshot record and return its id."""
-    client = get_supabase()
-    snapshot_id = str(uuid.uuid4())
-    row = {
-        "id": snapshot_id,
-        "camera_id": camera_id,
-        "detection_id": detection_id,
-        "url": url,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    client.table(SNAPSHOTS_TABLE).insert(row).execute()
-    return snapshot_id
+def insert_snapshot(camera_id: str, detection_id: str, url: str) -> str:
+    db = get_db()
+    try:
+        sid = str(uuid.uuid4())
+        db.execute(text("""
+            INSERT INTO snapshots (id, camera_id, detection_id, url, created_at)
+            VALUES (:id, :camera_id, :detection_id, :url, :created_at)
+        """), {"id": sid, "camera_id": camera_id, "detection_id": detection_id,
+               "url": url, "created_at": datetime.now(timezone.utc).isoformat()})
+        db.commit()
+        return sid
+    except Exception:
+        db.rollback(); raise
+    finally:
+        db.close()
 
 
-def query_detections(
-    camera_id: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    emotion: Optional[str] = None,
-    gender: Optional[str] = None,
-    page: int = 1,
-    per_page: int = 20,
-) -> list[dict]:
-    """
-    Query detections with optional filters.
+def query_detections(camera_id=None, date_from=None, date_to=None,
+                     emotion=None, gender=None, page=1, per_page=20) -> list[dict]:
+    db = get_db()
+    try:
+        conds, params = [], {"limit": per_page, "offset": (page - 1) * per_page}
+        if camera_id: conds.append("camera_id = :camera_id"); params["camera_id"] = camera_id
+        if date_from: conds.append("timestamp >= :date_from"); params["date_from"] = date_from
+        if date_to:   conds.append("timestamp <= :date_to");   params["date_to"] = date_to
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        rows = db.execute(text(f"""
+            SELECT * FROM detections {where}
+            ORDER BY timestamp DESC LIMIT :limit OFFSET :offset
+        """), params).mappings().all()
+        rows = [_parse_detection(dict(r)) for r in rows]
+        if emotion or gender:
+            filtered = []
+            for row in rows:
+                faces = row.get("faces", [])
+                m = [f for f in faces
+                     if (not emotion or f.get("emotion") == emotion)
+                     and (not gender or f.get("gender") == gender)]
+                if m:
+                    row["faces"] = m; filtered.append(row)
+            return filtered
+        return rows
+    finally:
+        db.close()
 
-    Emotion/gender filtering is done in-app because the ``faces`` column
-    is JSONB and Supabase client doesn't support deep JSON predicates well.
-    """
-    client = get_supabase()
-    query = client.table(DETECTIONS_TABLE).select("*")
 
-    if camera_id:
-        query = query.eq("camera_id", camera_id)
-    if date_from:
-        query = query.gte("timestamp", date_from)
-    if date_to:
-        query = query.lte("timestamp", date_to)
+def get_snapshots(page=1, per_page=20, camera_id=None) -> list[dict]:
+    db = get_db()
+    try:
+        conds, params = [], {"limit": per_page, "offset": (page - 1) * per_page}
+        if camera_id: conds.append("camera_id = :camera_id"); params["camera_id"] = camera_id
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        rows = db.execute(text(f"""
+            SELECT * FROM snapshots {where}
+            ORDER BY created_at DESC LIMIT :limit OFFSET :offset
+        """), params).mappings().all()
+        return [_parse_snapshot(dict(r)) for r in rows]
+    finally:
+        db.close()
 
-    query = query.order("timestamp", desc=True)
 
-    offset = (page - 1) * per_page
-    query = query.range(offset, offset + per_page - 1)
+def query_snapshots_enriched(camera_id=None, date=None, emotion=None, limit=20, offset=0) -> list[dict]:
+    db = get_db()
+    try:
+        conds, params = ["1=1"], {"limit": limit, "offset": offset}
+        if camera_id: conds.append("s.camera_id = :camera_id"); params["camera_id"] = camera_id
+        if date:      conds.append("DATE(s.created_at) = :date"); params["date"] = date
+        where = " AND ".join(conds)
+        rows = db.execute(text(f"""
+            SELECT s.id, s.url, s.created_at, s.camera_id, s.detection_id,
+                   c.name AS camera_name, d.faces AS faces_json, d.timestamp AS detection_timestamp
+            FROM snapshots s
+            LEFT JOIN cameras    c ON c.id = s.camera_id
+            LEFT JOIN detections d ON d.id = s.detection_id
+            WHERE {where}
+            ORDER BY s.created_at DESC LIMIT :limit OFFSET :offset
+        """), params).mappings().all()
 
-    result = query.execute()
-    rows = result.data or []
-
-    # In-app filter on faces JSONB for emotion / gender
-    if emotion or gender:
-        filtered: list[dict] = []
+        enriched = []
         for row in rows:
-            faces = row.get("faces", [])
-            matching_faces = [
-                f for f in faces
-                if (not emotion or f.get("emotion") == emotion)
-                and (not gender or f.get("gender") == gender)
-            ]
-            if matching_faces:
-                row["faces"] = matching_faces
-                filtered.append(row)
-        rows = filtered
-
-    return rows
-
-
-def get_snapshots(
-    page: int = 1,
-    per_page: int = 20,
-    camera_id: Optional[str] = None,
-) -> list[dict]:
-    """Return snapshots with pagination."""
-    client = get_supabase()
-    query = client.table(SNAPSHOTS_TABLE).select("*")
-
-    if camera_id:
-        query = query.eq("camera_id", camera_id)
-
-    query = query.order("created_at", desc=True)
-
-    offset = (page - 1) * per_page
-    query = query.range(offset, offset + per_page - 1)
-
-    result = query.execute()
-    return result.data or []
+            row = dict(row)
+            raw = row.get("faces_json")
+            faces = json.loads(raw) if isinstance(raw, str) else (raw or [])
+            face_info = next((f for f in faces if f.get("snapshot_url") == row.get("url")), {})
+            if not face_info and faces:
+                face_info = faces[0]
+            enriched.append({
+                "id": row["id"], "url": row.get("url", ""),
+                "gender": face_info.get("gender", ""), "emotion": face_info.get("emotion", ""),
+                "age": face_info.get("age", 0), "age_group": face_info.get("age_group", ""),
+                "camera_name": row.get("camera_name", ""),
+                "timestamp": str(row.get("detection_timestamp") or row.get("created_at", "")),
+            })
+        if emotion:
+            enriched = [e for e in enriched if e.get("emotion") == emotion]
+        return enriched
+    finally:
+        db.close()
 
 
-def query_snapshots_enriched(
-    camera_id: Optional[str] = None,
-    date: Optional[str] = None,
-    emotion: Optional[str] = None,
-    limit: int = 20,
-    offset: int = 0,
-) -> list[dict]:
-    """
-    Return enriched snapshot records with face data from the associated detection.
+def _parse_detection(row: dict) -> dict:
+    f = row.get("faces")
+    if f and isinstance(f, str): row["faces"] = json.loads(f)
+    if row.get("timestamp"): row["timestamp"] = str(row["timestamp"])
+    return row
 
-    Each result contains:
-    ``{id, url, gender, emotion, age, age_group, camera_name, timestamp}``
-    """
-    client = get_supabase()
-
-    query = (
-        client.table(SNAPSHOTS_TABLE)
-        .select("id, url, created_at, camera_id, detection_id, cameras(name), detections(faces, timestamp)")
-    )
-
-    if camera_id:
-        query = query.eq("camera_id", camera_id)
-
-    if date:
-        # Filter by date range
-        date_start = f"{date}T00:00:00+00:00"
-        date_end = f"{date}T23:59:59+00:00"
-        query = query.gte("created_at", date_start).lte("created_at", date_end)
-
-    query = query.order("created_at", desc=True).range(offset, offset + limit - 1)
-
-    result = query.execute()
-    rows = result.data or []
-
-    # Enrich each snapshot with face-level data from the detection JSONB
-    enriched: list[dict] = []
-    for row in rows:
-        detection_data = row.get("detections") or {}
-        camera_data = row.get("cameras") or {}
-        faces = detection_data.get("faces", []) if isinstance(detection_data, dict) else []
-
-        # Find the matching face by snapshot URL
-        face_info: dict = {}
-        for face in faces:
-            if face.get("snapshot_url") == row.get("url"):
-                face_info = face
-                break
-
-        # If no exact URL match, use the first face as fallback
-        if not face_info and faces:
-            face_info = faces[0]
-
-        item = {
-            "id": row["id"],
-            "url": row.get("url", ""),
-            "gender": face_info.get("gender", ""),
-            "emotion": face_info.get("emotion", ""),
-            "age": face_info.get("age", 0),
-            "age_group": face_info.get("age_group", ""),
-            "camera_name": camera_data.get("name", "") if isinstance(camera_data, dict) else "",
-            "timestamp": detection_data.get("timestamp", row.get("created_at", "")),
-        }
-        enriched.append(item)
-
-    # Apply emotion filter in-app (since it's inside JSONB)
-    if emotion:
-        enriched = [e for e in enriched if e.get("emotion") == emotion]
-
-    return enriched
-
+def _parse_snapshot(row: dict) -> dict:
+    if row.get("created_at"): row["created_at"] = str(row["created_at"])
+    return row

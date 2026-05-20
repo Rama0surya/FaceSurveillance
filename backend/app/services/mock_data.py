@@ -1,239 +1,81 @@
-"""
-Mock data generator for demo / development purposes.
-
-Generates fake detection, snapshot, and hourly_stats records
-so the dashboard has realistic data without a real RTSP camera.
-"""
-
 from __future__ import annotations
-
-import random
-import uuid
+import json, random, uuid
 from datetime import datetime, timezone, timedelta
+from sqlalchemy import text
+from app.core.db_client import get_db
 
-from app.core.supabase_client import get_supabase
+EMOTIONS   = ["happy","neutral","sad","angry","surprise","fear","disgust"]
+GENDERS    = ["male","female"]
+AGE_GROUPS = ["anak","remaja","dewasa","lansia"]
+AGE_RANGES = {"anak":(4,12),"remaja":(13,17),"dewasa":(18,59),"lansia":(60,85)}
+CAMERA_NAMES = ["Lobby Utama","Pintu Masuk","Area Parkir"]
+CAMERA_URLS  = ["rtsp://192.168.1.10:554/stream1","rtsp://192.168.1.11:554/stream1","rtsp://192.168.1.12:554/stream1"]
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-EMOTIONS = ["happy", "neutral", "sad", "angry", "surprise", "fear", "disgust"]
-GENDERS = ["male", "female"]
-AGE_GROUPS = ["anak", "remaja", "dewasa", "lansia"]
-AGE_RANGES = {
-    "anak": (4, 12),
-    "remaja": (13, 17),
-    "dewasa": (18, 59),
-    "lansia": (60, 85),
-}
-
-CAMERA_NAMES = [
-    "Lobby Utama",
-    "Pintu Masuk",
-    "Area Parkir",
-]
-
-CAMERA_URLS = [
-    "rtsp://192.168.1.10:554/stream1",
-    "rtsp://192.168.1.11:554/stream1",
-    "rtsp://192.168.1.12:554/stream1",
-]
-
-
-def _random_age(age_group: str) -> int:
-    lo, hi = AGE_RANGES[age_group]
-    return random.randint(lo, hi)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def generate_mock_data(
-    num_detections: int = 100,
-    hours_span: int = 48,
-) -> dict:
-    """
-    Populate the Supabase database with mock cameras, detections,
-    snapshots, and hourly_stats.
-
-    Returns a summary dict.
-    """
-    client = get_supabase()
-    now = datetime.now(timezone.utc)
-
-    # ------------------------------------------------------------------
-    # 1. Ensure demo cameras exist
-    # ------------------------------------------------------------------
-    camera_ids: list[str] = []
-
-    existing = client.table("cameras").select("id, name").execute()
-    existing_names = {r["name"] for r in (existing.data or [])}
-    existing_ids = [r["id"] for r in (existing.data or [])]
-
-    for i, name in enumerate(CAMERA_NAMES):
-        if name in existing_names:
-            # Reuse existing camera
-            cam = next(r for r in existing.data if r["name"] == name)
-            camera_ids.append(cam["id"])
-        else:
-            cam_id = str(uuid.uuid4())
-            client.table("cameras").insert({
-                "id": cam_id,
-                "name": name,
-                "rtsp_url": CAMERA_URLS[i],
-                "status": "offline",
-                "created_at": now.isoformat(),
-            }).execute()
-            camera_ids.append(cam_id)
-
-    # If there were already cameras not in our list, include them too
-    for cid in existing_ids:
-        if cid not in camera_ids:
-            camera_ids.append(cid)
-
-    # ------------------------------------------------------------------
-    # 2. Generate detections & snapshots
-    # ------------------------------------------------------------------
-    detection_count = 0
-    snapshot_count = 0
-    stats_buckets: dict[str, dict] = {}  # key = "camera_id|hour_iso"
-
-    for _ in range(num_detections):
-        camera_id = random.choice(camera_ids)
-        # Random timestamp in the last `hours_span` hours
-        offset_seconds = random.randint(0, hours_span * 3600)
-        ts = now - timedelta(seconds=offset_seconds)
-        timestamp = ts.isoformat()
-
-        # 1-3 faces per detection
-        num_faces = random.randint(1, 3)
-        faces: list[dict] = []
-
-        for _ in range(num_faces):
-            gender = random.choice(GENDERS)
-            emotion = random.choice(EMOTIONS)
-            age_group = random.choices(
-                AGE_GROUPS,
-                weights=[10, 15, 55, 20],  # realistic distribution
-                k=1,
-            )[0]
-            age = _random_age(age_group)
-            face_id = str(uuid.uuid4())
-
-            face = {
-                "id": face_id,
-                "bbox": {
-                    "x": random.randint(50, 500),
-                    "y": random.randint(30, 400),
-                    "w": random.randint(60, 150),
-                    "h": random.randint(60, 180),
-                },
-                "gender": gender,
-                "emotion": emotion,
-                "age_group": age_group,
-                "age": age,
-                "confidence": round(random.uniform(0.70, 0.99), 2),
-                "snapshot_url": f"/snapshots/mock/{face_id[:8]}.jpg",
-            }
-            faces.append(face)
-
-            # Accumulate stats for hourly bucket
-            hour_bucket = ts.replace(minute=0, second=0, microsecond=0).isoformat()
-            key = f"{camera_id}|{hour_bucket}"
-            if key not in stats_buckets:
-                stats_buckets[key] = {
-                    "camera_id": camera_id,
-                    "hour_bucket": hour_bucket,
-                    "total": 0,
-                    "male": 0,
-                    "female": 0,
-                    "emotions": {},
-                    "age_groups": {},
-                }
-            bucket = stats_buckets[key]
-            bucket["total"] += 1
-            if gender == "male":
-                bucket["male"] += 1
+def generate_mock_data(num_detections=100, hours_span=48) -> dict:
+    db = get_db(); now = datetime.now(timezone.utc)
+    try:
+        camera_ids = []
+        existing = {r["name"]: r["id"] for r in db.execute(text("SELECT id,name FROM cameras")).mappings().all()}
+        for i, name in enumerate(CAMERA_NAMES):
+            if name in existing:
+                camera_ids.append(existing[name])
             else:
-                bucket["female"] += 1
-            bucket["emotions"][emotion] = bucket["emotions"].get(emotion, 0) + 1
-            bucket["age_groups"][age_group] = bucket["age_groups"].get(age_group, 0) + 1
+                cid = str(uuid.uuid4())
+                db.execute(text("INSERT INTO cameras (id,name,rtsp_url,status,created_at) VALUES (:id,:n,:u,'offline',:t)"),
+                           {"id":cid,"n":name,"u":CAMERA_URLS[i],"t":now.isoformat()})
+                camera_ids.append(cid)
+        for cid in existing.values():
+            if cid not in camera_ids: camera_ids.append(cid)
+        db.commit()
 
-        # Insert detection
-        detection_id = str(uuid.uuid4())
-        client.table("detections").insert({
-            "id": detection_id,
-            "camera_id": camera_id,
-            "timestamp": timestamp,
-            "faces": faces,
-        }).execute()
-        detection_count += 1
+        det_count = snap_count = 0; buckets = {}
+        for _ in range(num_detections):
+            cam = random.choice(camera_ids)
+            ts = now - timedelta(seconds=random.randint(0, hours_span*3600))
+            ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
+            faces = []
+            for _ in range(random.randint(1,3)):
+                g = random.choice(GENDERS); e = random.choice(EMOTIONS)
+                ag = random.choices(AGE_GROUPS, weights=[10,15,55,20], k=1)[0]
+                age = random.randint(*AGE_RANGES[ag]); fid = str(uuid.uuid4())
+                faces.append({"id":fid,"bbox":{"x":random.randint(50,500),"y":random.randint(30,400),"w":random.randint(60,150),"h":random.randint(60,180)},
+                              "gender":g,"emotion":e,"age_group":ag,"age":age,
+                              "confidence":round(random.uniform(0.70,0.99),2),"snapshot_url":f"/snapshots/mock/{fid[:8]}.jpg"})
+                hb = ts.replace(minute=0,second=0,microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+                k = f"{cam}|{hb}"
+                if k not in buckets: buckets[k]={"camera_id":cam,"hour_bucket":hb,"total":0,"male":0,"female":0,"emotions":{},"age_groups":{}}
+                b=buckets[k]; b["total"]+=1
+                if g=="male": b["male"]+=1
+                else: b["female"]+=1
+                b["emotions"][e]=b["emotions"].get(e,0)+1; b["age_groups"][ag]=b["age_groups"].get(ag,0)+1
+            did = str(uuid.uuid4())
+            db.execute(text("INSERT INTO detections (id,camera_id,timestamp,faces) VALUES (:id,:c,:t,:f)"),
+                       {"id":did,"c":cam,"t":ts_str,"f":json.dumps(faces)}); det_count+=1
+            for face in faces:
+                db.execute(text("INSERT INTO snapshots (id,camera_id,detection_id,url,created_at) VALUES (:id,:c,:d,:u,:t)"),
+                           {"id":str(uuid.uuid4()),"c":cam,"d":did,"u":face["snapshot_url"],"t":ts_str}); snap_count+=1
+        db.commit()
 
-        # Insert snapshots
-        for face in faces:
-            snap_id = str(uuid.uuid4())
-            client.table("snapshots").insert({
-                "id": snap_id,
-                "camera_id": camera_id,
-                "detection_id": detection_id,
-                "url": face["snapshot_url"],
-                "created_at": timestamp,
-            }).execute()
-            snapshot_count += 1
-
-    # ------------------------------------------------------------------
-    # 3. Upsert hourly_stats
-    # ------------------------------------------------------------------
-    stats_count = 0
-    for key, bucket in stats_buckets.items():
-        camera_id = bucket["camera_id"]
-        hour_bucket = bucket["hour_bucket"]
-
-        # Check if row exists
-        existing_row = (
-            client.table("hourly_stats")
-            .select("id, total, male, female, emotions, age_groups")
-            .eq("camera_id", camera_id)
-            .eq("hour_bucket", hour_bucket)
-            .maybe_single()
-            .execute()
-        )
-
-        if existing_row and existing_row.data:
-            # Merge with existing
-            row = existing_row.data
-            emotions = row.get("emotions") or {}
-            age_groups = row.get("age_groups") or {}
-            for emo, cnt in bucket["emotions"].items():
-                emotions[emo] = emotions.get(emo, 0) + cnt
-            for ag, cnt in bucket["age_groups"].items():
-                age_groups[ag] = age_groups.get(ag, 0) + cnt
-
-            client.table("hourly_stats").update({
-                "total": (row.get("total") or 0) + bucket["total"],
-                "male": (row.get("male") or 0) + bucket["male"],
-                "female": (row.get("female") or 0) + bucket["female"],
-                "emotions": emotions,
-                "age_groups": age_groups,
-            }).eq("id", row["id"]).execute()
-        else:
-            client.table("hourly_stats").insert({
-                "id": str(uuid.uuid4()),
-                "camera_id": camera_id,
-                "hour_bucket": hour_bucket,
-                "total": bucket["total"],
-                "male": bucket["male"],
-                "female": bucket["female"],
-                "emotions": bucket["emotions"],
-                "age_groups": bucket["age_groups"],
-            }).execute()
-
-        stats_count += 1
-
-    return {
-        "cameras": len(camera_ids),
-        "detections": detection_count,
-        "snapshots": snapshot_count,
-        "hourly_stats_buckets": stats_count,
-    }
+        sc = 0
+        for key, b in buckets.items():
+            row = db.execute(text("SELECT id,total,male,female,emotions,age_groups FROM hourly_stats WHERE camera_id=:c AND hour_bucket=:h LIMIT 1"),
+                             {"c":b["camera_id"],"h":b["hour_bucket"]}).mappings().first()
+            if row:
+                row=dict(row)
+                emos = json.loads(row["emotions"]) if isinstance(row["emotions"],str) else (row["emotions"] or {})
+                ags  = json.loads(row["age_groups"]) if isinstance(row["age_groups"],str) else (row["age_groups"] or {})
+                for k,v in b["emotions"].items():   emos[k]=emos.get(k,0)+v
+                for k,v in b["age_groups"].items(): ags[k]=ags.get(k,0)+v
+                db.execute(text("UPDATE hourly_stats SET total=total+:t,male=male+:m,female=female+:f,emotions=:e,age_groups=:a WHERE id=:id"),
+                           {"t":b["total"],"m":b["male"],"f":b["female"],"e":json.dumps(emos),"a":json.dumps(ags),"id":row["id"]})
+            else:
+                db.execute(text("INSERT INTO hourly_stats (id,camera_id,hour_bucket,total,male,female,emotions,age_groups) VALUES (:id,:c,:h,:t,:m,:f,:e,:a)"),
+                           {"id":str(uuid.uuid4()),"c":b["camera_id"],"h":b["hour_bucket"],"t":b["total"],"m":b["male"],"f":b["female"],
+                            "e":json.dumps(b["emotions"]),"a":json.dumps(b["age_groups"])})
+            sc+=1
+        db.commit()
+        return {"cameras":len(camera_ids),"detections":det_count,"snapshots":snap_count,"hourly_stats_buckets":sc}
+    except Exception:
+        db.rollback(); raise
+    finally:
+        db.close()

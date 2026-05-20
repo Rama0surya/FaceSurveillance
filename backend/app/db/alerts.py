@@ -1,291 +1,210 @@
-"""
-CRUD operations for the ``alert_rules`` and ``alerts`` tables.
-"""
-
 from __future__ import annotations
-
+import json
 import logging
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-
-from app.core.supabase_client import get_supabase
+from sqlalchemy import text
+from app.core.db_client import get_db
 from app.models.schemas import AlertRuleCreate, AlertRuleUpdate
 
 logger = logging.getLogger(__name__)
 
-ALERT_RULES_TABLE = "alert_rules"
-ALERTS_TABLE = "alerts"
 
-
-# =====================================================================
-# Alert Rules CRUD
-# =====================================================================
+# ---------- Alert Rules ----------
 
 def create_alert_rule(data: AlertRuleCreate) -> dict:
-    """Insert a new alert rule and return it."""
-    client = get_supabase()
-    row = {
-        "id": str(uuid.uuid4()),
-        "name": data.name,
-        "rule_type": data.rule_type,
-        "condition": data.condition,
-        "severity": data.severity,
-        "camera_id": data.camera_id,
-        "is_active": data.is_active,
-        "cooldown_seconds": data.cooldown_seconds,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    db = get_db()
     try:
-        result = client.table(ALERT_RULES_TABLE).insert(row).execute()
-        return result.data[0] if result.data else row
+        rid = str(uuid.uuid4()); now = datetime.now(timezone.utc).isoformat()
+        db.execute(text("""
+            INSERT INTO alert_rules (id,name,rule_type,`condition`,severity,camera_id,is_active,cooldown_seconds,created_at,updated_at)
+            VALUES (:id,:name,:rt,:cond,:sev,:cam,:act,:cool,:now,:now)
+        """), {"id": rid, "name": data.name, "rt": data.rule_type, "cond": json.dumps(data.condition),
+               "sev": data.severity, "cam": data.camera_id, "act": 1 if data.is_active else 0,
+               "cool": data.cooldown_seconds, "now": now})
+        db.commit(); return get_alert_rule(rid)
     except Exception:
-        logger.exception("Failed to create alert rule")
-        raise
+        db.rollback(); logger.exception("create_alert_rule failed"); raise
+    finally:
+        db.close()
 
 
-def get_alert_rules(camera_id: Optional[str] = None) -> list[dict]:
-    """Return alert rules, optionally filtered by camera_id."""
-    client = get_supabase()
+def get_alert_rules(camera_id=None) -> list[dict]:
+    db = get_db()
     try:
-        query = client.table(ALERT_RULES_TABLE).select("*")
-        if camera_id:
-            query = query.eq("camera_id", camera_id)
-        query = query.order("created_at", desc=True)
-        result = query.execute()
-        return result.data or []
+        params = {}; cf = ""
+        if camera_id: cf = "AND camera_id = :c"; params["c"] = camera_id
+        rows = db.execute(text(f"SELECT * FROM alert_rules WHERE 1=1 {cf} ORDER BY created_at DESC"), params).mappings().all()
+        return [_par(dict(r)) for r in rows]
     except Exception:
-        logger.exception("Failed to fetch alert rules")
-        return []
+        logger.exception("get_alert_rules failed"); return []
+    finally:
+        db.close()
 
 
 def get_alert_rule(rule_id: str) -> Optional[dict]:
-    """Fetch a single alert rule by ID."""
-    client = get_supabase()
+    db = get_db()
     try:
-        result = (
-            client.table(ALERT_RULES_TABLE)
-            .select("*")
-            .eq("id", rule_id)
-            .maybe_single()
-            .execute()
-        )
-        return result.data if result else None
+        row = db.execute(text("SELECT * FROM alert_rules WHERE id=:id LIMIT 1"), {"id": rule_id}).mappings().first()
+        return _par(dict(row)) if row else None
     except Exception:
-        logger.exception("Failed to fetch alert rule %s", rule_id)
-        return None
+        logger.exception("get_alert_rule failed"); return None
+    finally:
+        db.close()
 
 
 def update_alert_rule(rule_id: str, data: AlertRuleUpdate) -> Optional[dict]:
-    """Update fields on an existing alert rule."""
-    client = get_supabase()
     updates = data.model_dump(exclude_none=True)
-    if not updates:
-        return get_alert_rule(rule_id)
-
+    if not updates: return get_alert_rule(rule_id)
+    db = get_db()
     try:
-        result = (
-            client.table(ALERT_RULES_TABLE)
-            .update(updates)
-            .eq("id", rule_id)
-            .execute()
-        )
-        if not result.data:
-            return None
-        return result.data[0]
+        if "condition" in updates: updates["condition"] = json.dumps(updates["condition"])
+        if "is_active" in updates: updates["is_active"] = 1 if updates["is_active"] else 0
+        updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+        sc = ", ".join((f"`{k}`=:{k}" if k=="condition" else f"{k}=:{k}") for k in updates)
+        updates["rule_id"] = rule_id
+        db.execute(text(f"UPDATE alert_rules SET {sc} WHERE id=:rule_id"), updates)
+        db.commit(); return get_alert_rule(rule_id)
     except Exception:
-        logger.exception("Failed to update alert rule %s", rule_id)
-        return None
+        db.rollback(); logger.exception("update_alert_rule failed"); return None
+    finally:
+        db.close()
 
 
 def delete_alert_rule(rule_id: str) -> bool:
-    """Delete an alert rule. Returns True if a row was removed."""
-    client = get_supabase()
+    db = get_db()
     try:
-        result = client.table(ALERT_RULES_TABLE).delete().eq("id", rule_id).execute()
-        return bool(result.data)
+        r = db.execute(text("DELETE FROM alert_rules WHERE id=:id"), {"id": rule_id})
+        db.commit(); return r.rowcount > 0
     except Exception:
-        logger.exception("Failed to delete alert rule %s", rule_id)
-        return False
+        db.rollback(); logger.exception("delete_alert_rule failed"); return False
+    finally:
+        db.close()
 
 
-# =====================================================================
-# Alerts CRUD
-# =====================================================================
+# ---------- Alerts ----------
 
-def create_alert(
-    rule_id: Optional[str],
-    camera_id: str,
-    alert_type: str,
-    severity: str,
-    message: str,
-    metadata: Optional[dict] = None,
-) -> dict:
-    """Insert a new alert record and return it."""
-    client = get_supabase()
-    row = {
-        "id": str(uuid.uuid4()),
-        "rule_id": rule_id,
-        "camera_id": camera_id,
-        "alert_type": alert_type,
-        "severity": severity,
-        "message": message,
-        "metadata": metadata,
-        "is_read": False,
-        "is_resolved": False,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+def create_alert(rule_id, camera_id, alert_type, severity, message, metadata=None) -> dict:
+    db = get_db()
     try:
-        result = client.table(ALERTS_TABLE).insert(row).execute()
-        return result.data[0] if result.data else row
+        aid = str(uuid.uuid4()); now = datetime.now(timezone.utc).isoformat()
+        db.execute(text("""
+            INSERT INTO alerts (id,rule_id,camera_id,alert_type,severity,message,metadata,is_read,is_resolved,created_at)
+            VALUES (:id,:rid,:cam,:at,:sev,:msg,:meta,0,0,:now)
+        """), {"id": aid, "rid": rule_id, "cam": camera_id, "at": alert_type,
+               "sev": severity, "msg": message, "meta": json.dumps(metadata) if metadata else None, "now": now})
+        db.commit(); return get_alert(aid)
     except Exception:
-        logger.exception("Failed to create alert")
-        raise
+        db.rollback(); logger.exception("create_alert failed"); raise
+    finally:
+        db.close()
 
 
-def get_alerts(
-    camera_id: Optional[str] = None,
-    severity: Optional[str] = None,
-    is_read: Optional[bool] = None,
-    limit: int = 50,
-    offset: int = 0,
-) -> list[dict]:
-    """Return alerts with optional filters and pagination."""
-    client = get_supabase()
+def get_alerts(camera_id=None, severity=None, is_read=None, limit=50, offset=0) -> list[dict]:
+    db = get_db()
     try:
-        query = client.table(ALERTS_TABLE).select("*")
-
-        if camera_id:
-            query = query.eq("camera_id", camera_id)
-        if severity:
-            query = query.eq("severity", severity)
-        if is_read is not None:
-            query = query.eq("is_read", is_read)
-
-        query = query.order("created_at", desc=True)
-        query = query.range(offset, offset + limit - 1)
-
-        result = query.execute()
-        return result.data or []
+        conds, params = [], {"limit": limit, "offset": offset}
+        if camera_id:          conds.append("camera_id=:cam");   params["cam"] = camera_id
+        if severity:           conds.append("severity=:sev");    params["sev"] = severity
+        if is_read is not None: conds.append("is_read=:ir");     params["ir"] = 1 if is_read else 0
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        rows = db.execute(text(f"SELECT * FROM alerts {where} ORDER BY created_at DESC LIMIT :limit OFFSET :offset"), params).mappings().all()
+        return [_paa(dict(r)) for r in rows]
     except Exception:
-        logger.exception("Failed to fetch alerts")
-        return []
+        logger.exception("get_alerts failed"); return []
+    finally:
+        db.close()
 
 
 def get_alert(alert_id: str) -> Optional[dict]:
-    """Fetch a single alert by ID."""
-    client = get_supabase()
+    db = get_db()
     try:
-        result = (
-            client.table(ALERTS_TABLE)
-            .select("*")
-            .eq("id", alert_id)
-            .maybe_single()
-            .execute()
-        )
-        return result.data if result else None
+        row = db.execute(text("SELECT * FROM alerts WHERE id=:id LIMIT 1"), {"id": alert_id}).mappings().first()
+        return _paa(dict(row)) if row else None
     except Exception:
-        logger.exception("Failed to fetch alert %s", alert_id)
-        return None
+        logger.exception("get_alert failed"); return None
+    finally:
+        db.close()
 
 
 def mark_alert_read(alert_id: str) -> bool:
-    """Mark a single alert as read."""
-    client = get_supabase()
+    db = get_db()
     try:
-        result = (
-            client.table(ALERTS_TABLE)
-            .update({"is_read": True})
-            .eq("id", alert_id)
-            .execute()
-        )
-        return bool(result.data)
+        r = db.execute(text("UPDATE alerts SET is_read=1 WHERE id=:id"), {"id": alert_id})
+        db.commit(); return r.rowcount > 0
     except Exception:
-        logger.exception("Failed to mark alert %s as read", alert_id)
-        return False
+        db.rollback(); return False
+    finally:
+        db.close()
 
 
-def mark_all_read(camera_id: Optional[str] = None) -> int:
-    """Mark all unread alerts as read. Returns count of updated rows."""
-    client = get_supabase()
+def mark_all_read(camera_id=None) -> int:
+    db = get_db()
     try:
-        query = (
-            client.table(ALERTS_TABLE)
-            .update({"is_read": True})
-            .eq("is_read", False)
-        )
-        if camera_id:
-            query = query.eq("camera_id", camera_id)
-
-        result = query.execute()
-        return len(result.data) if result.data else 0
+        params = {}; cf = ""
+        if camera_id: cf = "AND camera_id=:c"; params["c"] = camera_id
+        r = db.execute(text(f"UPDATE alerts SET is_read=1 WHERE is_read=0 {cf}"), params)
+        db.commit(); return r.rowcount
     except Exception:
-        logger.exception("Failed to mark all alerts as read")
-        return 0
+        db.rollback(); return 0
+    finally:
+        db.close()
 
 
 def resolve_alert(alert_id: str, resolved_by: str) -> bool:
-    """Resolve an alert with resolver info and timestamp."""
-    client = get_supabase()
+    db = get_db()
     try:
-        result = (
-            client.table(ALERTS_TABLE)
-            .update({
-                "is_resolved": True,
-                "resolved_by": resolved_by,
-                "resolved_at": datetime.now(timezone.utc).isoformat(),
-            })
-            .eq("id", alert_id)
-            .execute()
-        )
-        return bool(result.data)
+        r = db.execute(text("""
+            UPDATE alerts SET is_resolved=1, resolved_by=:by, resolved_at=:at WHERE id=:id
+        """), {"by": resolved_by, "at": datetime.now(timezone.utc).isoformat(), "id": alert_id})
+        db.commit(); return r.rowcount > 0
     except Exception:
-        logger.exception("Failed to resolve alert %s", alert_id)
-        return False
+        db.rollback(); return False
+    finally:
+        db.close()
 
 
-def get_unread_count(camera_id: Optional[str] = None) -> int:
-    """Return the count of unread alerts."""
-    client = get_supabase()
+def get_unread_count(camera_id=None) -> int:
+    db = get_db()
     try:
-        query = (
-            client.table(ALERTS_TABLE)
-            .select("id", count="exact")
-            .eq("is_read", False)
-        )
-        if camera_id:
-            query = query.eq("camera_id", camera_id)
-
-        result = query.execute()
-        return result.count if result.count is not None else 0
+        params = {}; cf = ""
+        if camera_id: cf = "AND camera_id=:c"; params["c"] = camera_id
+        return db.execute(text(f"SELECT COUNT(*) FROM alerts WHERE is_read=0 {cf}"), params).scalar() or 0
     except Exception:
-        logger.exception("Failed to get unread alert count")
         return 0
+    finally:
+        db.close()
 
 
 def check_cooldown(rule_id: str, cooldown_seconds: int) -> bool:
-    """
-    Check whether enough time has passed since the last alert for a rule.
-
-    Returns True if it's OK to trigger (cooldown elapsed), False otherwise.
-    """
-    client = get_supabase()
+    db = get_db()
     try:
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(seconds=cooldown_seconds)
-        ).isoformat()
-
-        result = (
-            client.table(ALERTS_TABLE)
-            .select("id", count="exact")
-            .eq("rule_id", rule_id)
-            .gte("created_at", cutoff)
-            .execute()
-        )
-
-        count = result.count if result.count is not None else 0
-        return count == 0  # True = no recent alerts, OK to trigger
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=cooldown_seconds)).isoformat()
+        cnt = db.execute(text("SELECT COUNT(*) FROM alerts WHERE rule_id=:rid AND created_at>=:cut"),
+                         {"rid": rule_id, "cut": cutoff}).scalar() or 0
+        return cnt == 0
     except Exception:
-        logger.exception("Failed to check cooldown for rule %s", rule_id)
-        return False  # On error, don't trigger
+        return False
+    finally:
+        db.close()
+
+
+# ---------- Helpers ----------
+
+def _par(row: dict) -> dict:
+    if row.get("condition") and isinstance(row["condition"], str):
+        row["condition"] = json.loads(row["condition"])
+    row["is_active"] = bool(row.get("is_active", 0))
+    for c in ("created_at","updated_at"):
+        if row.get(c): row[c] = str(row[c])
+    return row
+
+def _paa(row: dict) -> dict:
+    if row.get("metadata") and isinstance(row["metadata"], str):
+        row["metadata"] = json.loads(row["metadata"])
+    row["is_read"] = bool(row.get("is_read", 0))
+    row["is_resolved"] = bool(row.get("is_resolved", 0))
+    for c in ("created_at","resolved_at"):
+        if row.get(c): row[c] = str(row[c])
+    return row

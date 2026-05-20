@@ -1,14 +1,6 @@
 # ==========================================================================
 # Backend Dockerfile — Face Surveillance
 # ==========================================================================
-# Supports optional GPU acceleration via build argument.
-#
-# CPU build (default):
-#   docker build -t face-backend .
-#
-# GPU build (requires NVIDIA Container Toolkit on host):
-#   docker build --build-arg USE_GPU=true -t face-backend-gpu .
-# ==========================================================================
 
 FROM python:3.11-slim
 
@@ -16,39 +8,80 @@ ARG USE_GPU=false
 
 WORKDIR /app
 
-# System dependencies for OpenCV, DeepFace, ffmpeg, and health checks
+# --------------------------------------------------------------------------
+# Environment
+# --------------------------------------------------------------------------
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
+
+# --------------------------------------------------------------------------
+# System dependencies
+# --------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx \
+    build-essential \
+    gcc \
+    g++ \
+    curl \
+    ffmpeg \
+    git \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender1 \
-    ffmpeg \
-    curl \
+    libxrender-dev \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python dependencies
+# --------------------------------------------------------------------------
+# Copy requirements first (better Docker cache)
+# --------------------------------------------------------------------------
 COPY requirements.txt .
 
-# Install all requirements EXCEPT onnxruntime variants (handled below)
-RUN pip install --no-cache-dir $(grep -vE "onnxruntime" requirements.txt)
+# --------------------------------------------------------------------------
+# Upgrade pip
+# --------------------------------------------------------------------------
+RUN pip install --upgrade pip setuptools wheel
 
-# Conditional onnxruntime install: GPU or CPU
+# --------------------------------------------------------------------------
+# Install requirements except onnxruntime
+# --------------------------------------------------------------------------
+RUN grep -vE "onnxruntime|onnxruntime-gpu" requirements.txt > /tmp/requirements.txt && \
+    pip install -r /tmp/requirements.txt
+
+# --------------------------------------------------------------------------
+# Install ONNX Runtime
+# --------------------------------------------------------------------------
 RUN if [ "$USE_GPU" = "true" ]; then \
-        echo "Installing onnxruntime-gpu for CUDA support..." && \
-        pip install --no-cache-dir onnxruntime-gpu>=1.17.0; \
+        echo "Installing onnxruntime-gpu..." && \
+        pip install onnxruntime-gpu>=1.17.0; \
     else \
-        echo "Installing onnxruntime (CPU only)..." && \
-        pip install --no-cache-dir onnxruntime>=1.17.0; \
+        echo "Installing onnxruntime CPU..." && \
+        pip install onnxruntime>=1.17.0; \
     fi
 
-# Copy application code
+# --------------------------------------------------------------------------
+# Copy app source
+# --------------------------------------------------------------------------
 COPY . .
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
-    CMD curl -f http://localhost:8000/ || exit 1
+# --------------------------------------------------------------------------
+# Create snapshot directory
+# --------------------------------------------------------------------------
+RUN mkdir -p /app/snapshots
 
+# --------------------------------------------------------------------------
+# Healthcheck
+# --------------------------------------------------------------------------
+HEALTHCHECK --interval=30s --timeout=10s --retries=5 \
+CMD curl -f http://localhost:8000/api/settings/health || exit 1
+
+# --------------------------------------------------------------------------
+# Expose FastAPI port
+# --------------------------------------------------------------------------
 EXPOSE 8000
 
+# --------------------------------------------------------------------------
+# Run app
+# --------------------------------------------------------------------------
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

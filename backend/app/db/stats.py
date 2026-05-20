@@ -1,223 +1,119 @@
-"""
-Operations on the ``hourly_stats`` table.
-
-Each row represents a one-hour bucket for a single camera.
-"""
-
 from __future__ import annotations
-
+import json
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-import uuid
-
-from app.core.supabase_client import get_supabase
-
-TABLE = "hourly_stats"
+from sqlalchemy import text
+from app.core.db_client import get_db
 
 
-def _hour_bucket(dt: Optional[datetime] = None) -> str:
-    """Return an ISO timestamp truncated to the current hour."""
+def _hour_bucket(dt=None) -> str:
     dt = dt or datetime.now(timezone.utc)
     return dt.replace(minute=0, second=0, microsecond=0).isoformat()
 
-
-def upsert_hourly_stats(
-    camera_id: str,
-    gender: str,
-    emotion: str,
-    age_group: str,
-) -> None:
-    """
-    Increment counters in the current hour bucket.
-
-    If the bucket row doesn't exist yet it is created with initial values.
-    """
-    client = get_supabase()
-    hour = _hour_bucket()
-
-    # Try to fetch the existing bucket
-    result = (
-        client.table(TABLE)
-        .select("*")
-        .eq("camera_id", camera_id)
-        .eq("hour_bucket", hour)
-        .maybe_single()
-        .execute()
-    )
-
-    # if result.data:
-    if result and hasattr(result, 'data') and result.data:
-        # Update existing row
-        row = result.data
-        emotions: dict = row.get("emotions") or {}
-        age_groups: dict = row.get("age_groups") or {}
-
-        emotions[emotion] = emotions.get(emotion, 0) + 1
-        age_groups[age_group] = age_groups.get(age_group, 0) + 1
-
-        updates = {
-            "total": (row.get("total") or 0) + 1,
-            "male": (row.get("male") or 0) + (1 if gender == "Man" else 0),
-            "female": (row.get("female") or 0) + (1 if gender == "Woman" else 0),
-            "emotions": emotions,
-            "age_groups": age_groups,
-        }
-        client.table(TABLE).update(updates).eq("id", row["id"]).execute()
-    else:
-        # Insert new row
-        new_row = {
-            "id": str(uuid.uuid4()),
-            "camera_id": camera_id,
-            "hour_bucket": hour,
-            "total": 1,
-            "male": 1 if gender == "Man" else 0,
-            "female": 1 if gender == "Woman" else 0,
-            "emotions": {emotion: 1},
-            "age_groups": {age_group: 1},
-        }
-        client.table(TABLE).insert(new_row).execute()
+def _j(v) -> dict:
+    if not v: return {}
+    if isinstance(v, dict): return v
+    try: return json.loads(v)
+    except: return {}
 
 
-def get_today_stats(camera_id: Optional[str] = None) -> list[dict]:
-    """
-    Return aggregated stats for today (UTC), optionally filtered by camera.
-    """
-    client = get_supabase()
-    today_start = (
-        datetime.now(timezone.utc)
-        .replace(hour=0, minute=0, second=0, microsecond=0)
-        .isoformat()
-    )
-
-    query = (
-        client.table(TABLE)
-        .select("*")
-        .gte("hour_bucket", today_start)
-    )
-    if camera_id:
-        query = query.eq("camera_id", camera_id)
-
-    result = query.execute()
-    rows = result.data or []
-
-    # Aggregate per camera
-    agg: dict[str, dict] = {}
-    for row in rows:
-        cid = row["camera_id"]
-        if cid not in agg:
-            agg[cid] = {
-                "camera_id": cid,
-                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                "total": 0,
-                "male": 0,
-                "female": 0,
-                "emotions": {},
-                "age_groups": {},
-            }
-        bucket = agg[cid]
-        bucket["total"] += row.get("total", 0)
-        bucket["male"] += row.get("male", 0)
-        bucket["female"] += row.get("female", 0)
-
-        for emo, cnt in (row.get("emotions") or {}).items():
-            bucket["emotions"][emo] = bucket["emotions"].get(emo, 0) + cnt
-        for ag, cnt in (row.get("age_groups") or {}).items():
-            bucket["age_groups"][ag] = bucket["age_groups"].get(ag, 0) + cnt
-
-    return list(agg.values())
+def upsert_hourly_stats(camera_id: str, gender: str, emotion: str, age_group: str) -> None:
+    db = get_db()
+    try:
+        hour = _hour_bucket()
+        row = db.execute(text("""
+            SELECT * FROM hourly_stats WHERE camera_id = :c AND hour_bucket = :h LIMIT 1
+        """), {"c": camera_id, "h": hour}).mappings().first()
+        if row:
+            row = dict(row)
+            emos = _j(row.get("emotions")); ags = _j(row.get("age_groups"))
+            emos[emotion] = emos.get(emotion, 0) + 1
+            ags[age_group] = ags.get(age_group, 0) + 1
+            db.execute(text("""
+                UPDATE hourly_stats SET total=total+1, male=male+:m, female=female+:f,
+                    emotions=:e, age_groups=:a WHERE id=:id
+            """), {"m": 1 if gender=="Man" else 0, "f": 1 if gender=="Woman" else 0,
+                   "e": json.dumps(emos), "a": json.dumps(ags), "id": row["id"]})
+        else:
+            db.execute(text("""
+                INSERT INTO hourly_stats (id,camera_id,hour_bucket,total,male,female,emotions,age_groups)
+                VALUES (:id,:c,:h,:t,:m,:f,:e,:a)
+            """), {"id": str(uuid.uuid4()), "c": camera_id, "h": hour, "t": 1,
+                   "m": 1 if gender=="Man" else 0, "f": 1 if gender=="Woman" else 0,
+                   "e": json.dumps({emotion: 1}), "a": json.dumps({age_group: 1})})
+        db.commit()
+    except Exception:
+        db.rollback(); raise
+    finally:
+        db.close()
 
 
-def get_hourly_stats(
-    camera_id: Optional[str] = None,
-    date: Optional[str] = None,
-) -> list[dict]:
-    """
-    Return hour-by-hour stats for a given date (defaults to today).
-    """
-    client = get_supabase()
-
-    if date:
-        day_start = datetime.fromisoformat(date).replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
-        )
-    else:
-        day_start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-
-    day_end = day_start + timedelta(days=1)
-
-    query = (
-        client.table(TABLE)
-        .select("*")
-        .gte("hour_bucket", day_start.isoformat())
-        .lt("hour_bucket", day_end.isoformat())
-    )
-    if camera_id:
-        query = query.eq("camera_id", camera_id)
-
-    query = query.order("hour_bucket", desc=False)
-    result = query.execute()
-
-    rows = result.data or []
-    for row in rows:
-        # Parse the hour number for charting convenience
-        hb = row.get("hour_bucket", "")
-        try:
-            row["hour"] = datetime.fromisoformat(hb).hour
-        except Exception:
-            row["hour"] = None
-        row["date"] = day_start.strftime("%Y-%m-%d")
-
-    return rows
+def get_today_stats(camera_id=None) -> list[dict]:
+    db = get_db()
+    try:
+        today = datetime.now(timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0).isoformat()
+        params = {"today": today}
+        cf = ""
+        if camera_id: cf = "AND camera_id = :c"; params["c"] = camera_id
+        rows = db.execute(text(f"SELECT * FROM hourly_stats WHERE hour_bucket >= :today {cf}"), params).mappings().all()
+        agg = {}
+        for row in rows:
+            row = dict(row); cid = row["camera_id"]
+            if cid not in agg:
+                agg[cid] = {"camera_id": cid, "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                            "total": 0, "male": 0, "female": 0, "emotions": {}, "age_groups": {}}
+            b = agg[cid]; b["total"] += row.get("total",0); b["male"] += row.get("male",0); b["female"] += row.get("female",0)
+            for k,v in _j(row.get("emotions")).items(): b["emotions"][k] = b["emotions"].get(k,0)+v
+            for k,v in _j(row.get("age_groups")).items(): b["age_groups"][k] = b["age_groups"].get(k,0)+v
+        return list(agg.values())
+    finally:
+        db.close()
 
 
-def get_comparison_stats(camera_id: Optional[str] = None) -> dict:
-    """
-    Compare today's total detections with yesterday's.
+def get_hourly_stats(camera_id=None, date=None) -> list[dict]:
+    db = get_db()
+    try:
+        if date:
+            ds = datetime.fromisoformat(date).replace(hour=0,minute=0,second=0,microsecond=0,tzinfo=timezone.utc)
+        else:
+            ds = datetime.now(timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0)
+        de = ds + timedelta(days=1)
+        params = {"ds": ds.isoformat(), "de": de.isoformat()}
+        cf = ""
+        if camera_id: cf = "AND camera_id = :c"; params["c"] = camera_id
+        rows = db.execute(text(f"""
+            SELECT * FROM hourly_stats WHERE hour_bucket >= :ds AND hour_bucket < :de {cf}
+            ORDER BY hour_bucket ASC
+        """), params).mappings().all()
+        result = []
+        for row in rows:
+            row = dict(row); row["emotions"] = _j(row.get("emotions")); row["age_groups"] = _j(row.get("age_groups"))
+            hb = str(row.get("hour_bucket",""))
+            try: row["hour"] = datetime.fromisoformat(hb).hour
+            except: row["hour"] = None
+            row["date"] = ds.strftime("%Y-%m-%d"); row["hour_bucket"] = hb
+            result.append(row)
+        return result
+    finally:
+        db.close()
 
-    Returns ``{today: {total}, yesterday: {total}, change_pct}``.
-    """
-    client = get_supabase()
 
-    now = datetime.now(timezone.utc)
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday_start = today_start - timedelta(days=1)
-
-    # ---- Today ----
-    q_today = (
-        client.table(TABLE)
-        .select("total")
-        .gte("hour_bucket", today_start.isoformat())
-    )
-    if camera_id:
-        q_today = q_today.eq("camera_id", camera_id)
-    result_today = q_today.execute()
-
-    today_total = sum(r.get("total", 0) for r in (result_today.data or []))
-
-    # ---- Yesterday ----
-    q_yesterday = (
-        client.table(TABLE)
-        .select("total")
-        .gte("hour_bucket", yesterday_start.isoformat())
-        .lt("hour_bucket", today_start.isoformat())
-    )
-    if camera_id:
-        q_yesterday = q_yesterday.eq("camera_id", camera_id)
-    result_yesterday = q_yesterday.execute()
-
-    yesterday_total = sum(r.get("total", 0) for r in (result_yesterday.data or []))
-
-    # ---- Change percentage ----
-    if yesterday_total > 0:
-        change_pct = round(((today_total - yesterday_total) / yesterday_total) * 100, 1)
-    else:
-        change_pct = 100.0 if today_total > 0 else 0.0
-
-    return {
-        "today": {"total": today_total},
-        "yesterday": {"total": yesterday_total},
-        "change_pct": change_pct,
-    }
-
+def get_comparison_stats(camera_id=None) -> dict:
+    db = get_db()
+    try:
+        now = datetime.now(timezone.utc)
+        ts = now.replace(hour=0,minute=0,second=0,microsecond=0)
+        ys = ts - timedelta(days=1)
+        cf = ""; p_t = {"s": ts.isoformat()}; p_y = {"s": ys.isoformat(), "e": ts.isoformat()}
+        if camera_id:
+            cf = "AND camera_id = :c"; p_t["c"] = camera_id; p_y["c"] = camera_id
+        today_total = db.execute(text(f"SELECT COALESCE(SUM(total),0) FROM hourly_stats WHERE hour_bucket >= :s {cf}"), p_t).scalar() or 0
+        yest_total  = db.execute(text(f"SELECT COALESCE(SUM(total),0) FROM hourly_stats WHERE hour_bucket >= :s AND hour_bucket < :e {cf}"), p_y).scalar() or 0
+        if yest_total > 0:
+            pct = round(((today_total - yest_total) / yest_total) * 100, 1)
+        else:
+            pct = 100.0 if today_total > 0 else 0.0
+        return {"today": {"total": int(today_total)}, "yesterday": {"total": int(yest_total)}, "change_pct": pct}
+    finally:
+        db.close()

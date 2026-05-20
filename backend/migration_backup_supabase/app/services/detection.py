@@ -32,7 +32,7 @@ import numpy as np
 from PIL import Image
 
 from app.core.config import settings
-from app.core.db_client import upload_snapshot
+from app.core.supabase_client import upload_snapshot
 from app.core.websocket import manager as ws_manager
 from app.db.detections import insert_detection, insert_snapshot
 from app.db.stats import upsert_hourly_stats
