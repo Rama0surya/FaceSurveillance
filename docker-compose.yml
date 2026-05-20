@@ -1,49 +1,140 @@
 services:
-  # ----------------------------------------------------------------
-  # MediaMTX — RTSP proxy server (optional but recommended)
-  # ----------------------------------------------------------------
-  mediamtx:
-    image: bluenviron/mediamtx:latest
-    container_name: face_surveillance_mediamtx
-    ports:
-      - "8554:8554"   # RTSP
-      - "1935:1935"   # RTMP
-      - "8888:8888"   # HLS
-      - "9997:9997"   # API
-    volumes:
-      - ./mediamtx/mediamtx.yml:/mediamtx.yml
+  # ------------------------------------------------------------
+  # MySQL
+  # ------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: face_surveillance_mysql
     restart: unless-stopped
 
-  # ----------------------------------------------------------------
-  # Backend — FastAPI + AI detection engine
-  # ----------------------------------------------------------------
+    environment:
+      MYSQL_ROOT_PASSWORD:  ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE:       ${DB_NAME}
+      MYSQL_USER:           ${DB_USER}
+      MYSQL_PASSWORD:       ${DB_PASSWORD}
+
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+
+    ports:
+      - "3306:3306"
+
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+    networks:
+      - face-net
+
+  # ------------------------------------------------------------
+  # MediaMTX
+  # ------------------------------------------------------------
+  mediamtx:
+    image: bluenviron/mediamtx:1.9.3
+    container_name: face_surveillance_mediamtx
+    restart: unless-stopped
+
+    ports:
+      - "8554:8554"
+      - "8888:8888"
+      - "9997:9997"
+
+    volumes:
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
+
+    networks:
+      - face-net
+
+  # ------------------------------------------------------------
+  # Backend
+  # ------------------------------------------------------------
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+
     container_name: face_surveillance_backend
+
+    restart: unless-stopped
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mediamtx:
+        condition: service_started
+
     ports:
       - "8000:8000"
+
     env_file:
       - .env
+
     environment:
-      - ENV=development
-      - MEDIAMTX_API_URL=http://mediamtx:9997
-      - MEDIAMTX_RTSP_URL=rtsp://mediamtx:8554
-      - USE_MEDIAMTX=true
+      ENV: development
+
+      # --------------------------------------------------------
+      # MySQL
+      # --------------------------------------------------------
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+
+      # --------------------------------------------------------
+      # AI Settings
+      # --------------------------------------------------------
+      FACE_DETECTOR: yolov8
+      FACE_TRACKER: bytetrack
+
+      YOLO_CONFIDENCE: 0.5
+      YOLO_MODEL_PATH: yolov8n-face-lindevs.pt
+
+      INSIGHT_MODEL: buffalo_l
+      USE_GPU: auto
+
+      # --------------------------------------------------------
+      # Snapshot
+      # --------------------------------------------------------
+      SNAPSHOT_STORAGE: local
+      SNAPSHOT_LOCAL_DIR: /app/snapshots
+
+      # --------------------------------------------------------
+      # MediaMTX
+      # --------------------------------------------------------
+      MEDIAMTX_API_URL: http://mediamtx:9997
+      MEDIAMTX_RTSP_URL: rtsp://mediamtx:8554
+      USE_MEDIAMTX: "True"
+
+      # --------------------------------------------------------
+      # CORS
+      # --------------------------------------------------------
+      CORS_ORIGINS: '["http://localhost:5173"]'
+
     volumes:
       - ./backend:/app
       - ./snapshots:/app/snapshots
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    depends_on:
-      - mediamtx
-    restart: unless-stopped
+
+    command: >
+      sh -c "
+      python -m pip install --no-cache-dir pymysql sqlalchemy &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      "
+
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
       interval: 30s
       timeout: 10s
-      retries: 3
-    # GPU support — Docker will ignore this if no NVIDIA runtime is available
+      retries: 5
+
     deploy:
       resources:
         reservations:
@@ -52,23 +143,56 @@ services:
               count: all
               capabilities: [gpu]
 
-  # ----------------------------------------------------------------
-  # Frontend — React + Vite dashboard
-  # ----------------------------------------------------------------
+    networks:
+      - face-net
+
+  # ------------------------------------------------------------
+  # Frontend
+  # ------------------------------------------------------------
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+
+      args:
+        VITE_API_URL: http://${HOST_IP:-localhost}:8000
+        VITE_MEDIAMTX_URL: http://${HOST_IP:-localhost}:8888
+
     container_name: face_surveillance_frontend
+
+    restart: unless-stopped
+
+    depends_on:
+      backend:
+        condition: service_healthy
+
     ports:
       - "5173:5173"
+
     env_file:
       - ./frontend/.env
+
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+
     volumes:
       - ./frontend:/app
       - /app/node_modules
-    command: npm run dev -- --host
-    depends_on:
-      backend:
-        condition: service_started
-    restart: unless-stopped
+
+    command: npm run dev -- --host 0.0.0.0
+
+    networks:
+      - face-net
+
+# ------------------------------------------------------------
+# Volumes
+# ------------------------------------------------------------
+volumes:
+  mysql_data:
+
+# ------------------------------------------------------------
+# Network
+# ------------------------------------------------------------
+networks:
+  face-net:
+    driver: bridge

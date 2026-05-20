@@ -1,11 +1,8 @@
 /**
  * CameraCard — single camera entry displayed in the configuration grid.
- *
- * Shows name, RTSP URL, status indicator, and action buttons
- * (Start, Stop, Edit, Delete, Set Detection Zone).
  */
 
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Play,
   Square,
@@ -22,6 +19,7 @@ import AddCameraModal from './AddCameraModal';
 import DetectionZoneEditor from './DetectionZoneEditor';
 
 const API_BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+const WS_BASE = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000';
 
 interface Props {
   camera: Camera;
@@ -43,6 +41,49 @@ export default function CameraCard({
   const [editOpen, setEditOpen] = useState(false);
   const [zoneOpen, setZoneOpen] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [previewFrame, setPreviewFrame] = useState<string | null>(null);
+  const previewWsRef = useRef<WebSocket | null>(null);
+
+  // Preview mini WebSocket
+  // Preview mini WebSocket
+useEffect(() => {
+  if (camera.status !== 'live' && camera.status !== 'processing') {
+    setPreviewFrame(null);
+    if (previewWsRef.current) {
+      previewWsRef.current.close();
+      previewWsRef.current = null;
+    }
+    return;
+  }
+
+  const ws = new WebSocket(`${WS_BASE}/ws/stream/${camera.id}`);
+  previewWsRef.current = ws;
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'frame' && msg.data) {
+        setPreviewFrame(msg.data);
+      }
+    } catch { /* no-op */ }
+  };
+
+  // Only close if it's already active; otherwise, handle it gracefully
+  ws.onerror = () => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.close();
+    }
+  };
+
+  return () => {
+    // Explicitly check readyState to minimize browser console noise
+    if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
+      ws.close();
+    }
+    previewWsRef.current = null;
+  };
+}, [camera.id, camera.status]);
+
 
   /* ── API helpers ──────────────────────────────────────────── */
 
@@ -54,7 +95,6 @@ export default function CameraCard({
       });
       if (res.ok) onStatusChange(camera.id, 'live');
     } catch {
-      // silently handle if backend unreachable
       onStatusChange(camera.id, 'live');
     } finally {
       setLoading(false);
@@ -80,9 +120,7 @@ export default function CameraCard({
     (async () => {
       try {
         await fetch(`${API_BASE}/api/cameras/${camera.id}`, { method: 'DELETE' });
-      } catch {
-        /* no-op */
-      }
+      } catch { /* no-op */ }
       onDelete(camera.id);
     })();
   }
@@ -94,9 +132,7 @@ export default function CameraCard({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
       });
-    } catch {
-      /* no-op */
-    }
+    } catch { /* no-op */ }
     onUpdate(camera.id, data);
     setEditOpen(false);
   }
@@ -116,8 +152,24 @@ export default function CameraCard({
       <div className="cam-card" id={`cam-card-${camera.id}`}>
         {/* Preview area */}
         <div className="cam-card__preview">
-          <Video size={32} className="cam-card__preview-icon" />
-          <span className="cam-card__preview-label">{camera.rtsp_url}</span>
+          {previewFrame ? (
+            <img
+              src={`data:image/jpeg;base64,${previewFrame}`}
+              alt="preview"
+              style={{
+                width: '100%',
+                height: '100%',
+                objectFit: 'cover',
+                borderRadius: '6px 6px 0 0',
+              }}
+              draggable={false}
+            />
+          ) : (
+            <>
+              <Video size={32} className="cam-card__preview-icon" />
+              <span className="cam-card__preview-label">{camera.rtsp_url}</span>
+            </>
+          )}
 
           {/* Status badge */}
           <span className={`cam-card__status ${dotClass}`}>

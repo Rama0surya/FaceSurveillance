@@ -44,16 +44,16 @@ function App() {
   }, []);
 
   async function fetchCameras() {
-    try {
-      const res = await fetch(`${API_BASE}/api/cameras`);
-      if (res.ok) {
-        const data: Camera[] = await res.json();
-        setCameras(data);
-        // Auto-select first camera if none selected
-        if (data.length > 0) {
-          setActiveCamera(data[0]);
-        }
-      }
+  try {
+    const res = await fetch(`${API_BASE}/api/cameras`);
+    if (res.ok) {
+      const data: Camera[] = await res.json();
+      setCameras(data);
+      // Auto-select camera yang live/processing, atau fallback ke pertama
+      const liveCamera = data.find(c => c.status === 'live' || c.status === 'processing');
+      setActiveCamera(liveCamera ?? data[0]);
+    }
+    
     } catch {
       // Backend may not be running — use mock cameras for development
       const mockCameras: Camera[] = [

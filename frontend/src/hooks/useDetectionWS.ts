@@ -70,8 +70,8 @@ export function useDetectionWS() {
           switch (msg.type) {
             /* ---- Frame update ---- */
             case 'frame': {
-              if (msg.frame) {
-                setCurrentFrame(msg.frame);
+              if (msg.data) {
+                setCurrentFrame(msg.data);
               }
               break;
             }
