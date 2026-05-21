@@ -198,6 +198,7 @@ export interface DetectionConfigPayload {
   detection_interval?: number;
   frame_fps?: number;
   deepface_model?: string;
+  face_detector?: string;
 }
 
 export async function updateDetectionConfig(data: DetectionConfigPayload) {

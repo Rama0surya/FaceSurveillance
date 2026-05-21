@@ -136,6 +136,13 @@ class SystemInfo:
 
         return {
             "deepface_model": settings.DEEPFACE_MODEL,
+            "face_detector": settings.FACE_DETECTOR,
+            "yolo_confidence": settings.YOLO_CONFIDENCE,
+            "face_tracker": settings.FACE_TRACKER,
+            "detection_interval": settings.DETECTION_INTERVAL_SECONDS,
+            "frame_broadcast_fps": settings.FRAME_BROADCAST_FPS,
+            "available_models": ["VGG-Face", "Facenet", "OpenFace", "DeepID", "ArcFace", "Dlib"],
+            "available_detectors": ["opencv", "retinaface", "mtcnn", "ssd", "dlib", "yolov8"],
             "detection_interval": settings.DETECTION_INTERVAL_SECONDS,
             "frame_broadcast_fps": settings.FRAME_BROADCAST_FPS,
             "available_models": [

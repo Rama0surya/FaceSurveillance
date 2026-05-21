@@ -80,6 +80,7 @@ export default function SettingsPage() {
         setModel(info.models.deepface_model);
         setInterval_(info.models.detection_interval);
         setFps(info.models.frame_broadcast_fps);
+        setDetector(info.models.face_detector ?? 'opencv'); 
       }
     } catch {
       // Use fallback mock data when backend is offline
@@ -116,7 +117,12 @@ export default function SettingsPage() {
     setSaving(true);
     setSaveMsg('');
     try {
-      await updateDetectionConfig({ detection_interval: interval, frame_fps: fps, deepface_model: model });
+      await updateDetectionConfig({ 
+        detection_interval: interval, 
+        frame_fps: fps, 
+        deepface_model: model,
+        face_detector: detector,   // ← tambah ini
+      });
       setSaveMsg('Configuration saved successfully!');
       setTimeout(() => setSaveMsg(''), 3000);
     } catch { setSaveMsg('Failed to save configuration.'); }
