@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from app.core.config import settings
 from app.services.detection import detection_engine
 from app.services import stats_broadcaster
+from app.services.system_info import system_info_cache
 
 # Configure logging
 logging.basicConfig(
@@ -48,6 +49,10 @@ async def lifespan(app: FastAPI):
     from app.services.model_manager import model_manager
     model_manager.load_models()
 
+    # Start the system-info background cache (polls every 60s)
+    import asyncio
+    system_info_cache.start(loop=asyncio.get_running_loop())
+
     logger.info("API ready ✓")
 
     yield
@@ -60,6 +65,9 @@ async def lifespan(app: FastAPI):
 
     # Cancel the stats broadcaster
     stats_broadcaster.stop()
+
+    # Stop system-info polling
+    system_info_cache.stop()
 
     logger.info("Shutdown complete ✓")
 

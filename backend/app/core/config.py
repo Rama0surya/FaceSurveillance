@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     USE_GPU: str = "auto"
     TRACK_REANALYZE_TTL: int = 300
 
+    # Multi-thread pipeline queue sizes
+    FRAME_QUEUE_SIZE: int = 2       # Thread A → B: small = always-fresh frames
+    ANALYSIS_QUEUE_SIZE: int = 10   # Thread B → C: buffer for heavy inference
+
     SNAPSHOT_STORAGE: str = "local"
     SNAPSHOT_LOCAL_DIR: str = "snapshots"
 

@@ -1,17 +1,32 @@
 """
 Detection engine — runs face detection on RTSP/HLS streams.
 
-Each camera gets its own ``StreamWorker`` thread that:
-  1. Opens the stream with ``cv2.VideoCapture``
-  2. Every *N* seconds runs the detection pipeline on the latest frame
-  3. Classifies age, crops faces, saves snapshots
-  4. Persists results to Supabase
-  5. Broadcasts via WebSocket
-  6. Streams frames (base64 JPEG) to WS clients at max FRAME_BROADCAST_FPS
+Architecture: 3-Thread Producer-Consumer Pipeline
+=================================================
+
+Each camera gets its own ``StreamWorker`` with **three decoupled threads**:
+
+  Thread A — **RTSP Frame Grabber**
+    Reads frames from the RTSP stream as fast as possible (30 FPS+).
+    Puts frames into a bounded ``frame_queue`` (maxsize=2).
+    If the queue is full, the oldest frame is **dropped** (frame-skipping)
+    so that Thread B always gets the freshest frame available.
+
+  Thread B — **YOLO + ByteTrack Detector**
+    Pulls frames from ``frame_queue``, runs YOLOv8n-face detection and
+    ByteTrack tracking.  Broadcasts annotated frames to WebSocket clients.
+    When a **new track_id** appears, it packages a lightweight
+    ``AnalysisTask`` (face crop + metadata) and enqueues it for Thread C.
+
+  Thread C — **Heavy Inference Worker**
+    Pulls ``AnalysisTask`` items from ``analysis_queue``.
+    Runs InsightFace (age/gender) + DeepFace (emotion), saves snapshots,
+    persists to DB, evaluates alerts, and broadcasts results via WebSocket.
+    This thread is invoked **only for new faces**, saving ~80% GPU/CPU.
 
 Pipeline modes:
-  - **Modern** (default): YOLOv8n-face → ByteTrack → InsightFace age/gender → DeepFace emotion
-  - **Legacy** (fallback): DeepFace.analyze() for everything (if ultralytics/insightface unavailable)
+  - **Modern** (default): YOLOv8n-face → ByteTrack → InsightFace → DeepFace emotion
+  - **Legacy** (fallback): DeepFace.analyze() for everything
 """
 
 from __future__ import annotations
@@ -20,10 +35,12 @@ import asyncio
 import base64
 import io
 import logging
+import queue
 import threading
 import time
 import uuid
 
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -90,18 +107,63 @@ def _is_face_in_zone(
 
 
 # =====================================================================
-# Stream worker (runs in a dedicated thread)
+# AnalysisTask — immutable work item for Thread C
+# =====================================================================
+
+@dataclass(frozen=True)
+class AnalysisTask:
+    """Immutable data container passed from Thread B → Thread C.
+
+    Using ``frozen=True`` prevents accidental mutation across threads.
+    All NumPy arrays are **independent copies** (ownership transferred
+    at creation time), so no race conditions on pixel data.
+    """
+    camera_id: str
+    frame_crop: np.ndarray       # Padded face crop for InsightFace (independent copy)
+    full_frame: np.ndarray       # Full frame copy for snapshot saving
+    bbox: dict                   # {"x", "y", "w", "h"} — plain dict, safe
+    track_id: int
+    confidence: float
+    timestamp: str
+
+    class Config:
+        # Allow numpy arrays in frozen dataclass
+        arbitrary_types_allowed = True
+
+
+# =====================================================================
+# Stream worker (3-thread producer-consumer pipeline)
 # =====================================================================
 
 class StreamWorker:
-    """Background worker that reads frames and runs detection."""
+    """Background worker that reads frames and runs detection.
+
+    Manages three threads per camera:
+      - Thread A: RTSP frame grabber  (I/O-bound, never blocked by AI)
+      - Thread B: YOLO + ByteTrack    (GPU-bound, fast ~30-80ms)
+      - Thread C: Heavy inference      (GPU-bound, slow, only new faces)
+    """
 
     def __init__(self, camera_id: str, rtsp_url: str, loop: asyncio.AbstractEventLoop) -> None:
         self.camera_id = camera_id
         self.rtsp_url = rtsp_url
         self._loop = loop  # main asyncio event loop (for WS broadcast)
         self._stop_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+
+        # ---- Inter-thread queues ----
+        # Frame queue: Thread A → Thread B
+        # Small maxsize ensures Thread B always gets the freshest frame.
+        self._frame_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(
+            maxsize=max(1, settings.FRAME_QUEUE_SIZE),
+        )
+        # Analysis queue: Thread B → Thread C
+        # Larger buffer since Thread C is slower but called less frequently.
+        self._analysis_queue: queue.Queue[Optional[AnalysisTask]] = queue.Queue(
+            maxsize=max(1, settings.ANALYSIS_QUEUE_SIZE),
+        )
+
+        # ---- Thread references ----
+        self._threads: list[threading.Thread] = []
 
         # Load detection zone from camera config
         self._detection_zone: Optional[dict] = None
@@ -144,151 +206,208 @@ class StreamWorker:
     # ---- lifecycle ---------------------------------------------------
 
     def start(self) -> None:
+        """Spin up all three pipeline threads."""
         self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._run,
-            name=f"stream-{self.camera_id[:8]}",
-            daemon=True,
+
+        # Drain any stale items from previous runs
+        self._drain_queue(self._frame_queue)
+        self._drain_queue(self._analysis_queue)
+
+        thread_specs = [
+            ("grabber",  self._frame_grabber_loop),
+            ("detector", self._detection_loop),
+            ("analyzer", self._analysis_worker_loop),
+        ]
+
+        for name, target in thread_specs:
+            t = threading.Thread(
+                target=target,
+                name=f"{name}-{self.camera_id[:8]}",
+                daemon=True,
+            )
+            self._threads.append(t)
+            t.start()
+
+        logger.info(
+            "StreamWorker started for camera %s — 3 threads active",
+            self.camera_id,
         )
-        self._thread.start()
 
     def stop(self) -> None:
+        """Signal all threads to stop and wait for them to finish."""
         self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=10)
-        self._thread = None
+
+        # Inject sentinel values to unblock any thread waiting on queue.get()
+        try:
+            self._frame_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            self._analysis_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+        for t in self._threads:
+            if t.is_alive():
+                t.join(timeout=10)
+        self._threads.clear()
+
+        logger.info("StreamWorker stopped for camera %s", self.camera_id)
 
     @property
     def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        """True if at least the grabber and detector threads are running."""
+        return any(t.is_alive() for t in self._threads)
 
-    # ---- main loop ---------------------------------------------------
+    @staticmethod
+    def _drain_queue(q: queue.Queue) -> None:
+        """Empty a queue without blocking (best-effort cleanup)."""
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
 
-    def _run(self) -> None:
-        """Thread entry-point: open stream → read → detect → broadcast."""
-        logger.info("Starting stream worker for camera %s (%s)", self.camera_id, self.rtsp_url)
+    # =================================================================
+    # THREAD A — RTSP Frame Grabber
+    # =================================================================
+
+    def _frame_grabber_loop(self) -> None:
+        """Thread A: Read frames from RTSP as fast as possible.
+
+        This thread's ONLY job is to keep the RTSP buffer drained and
+        deliver the freshest possible frame to Thread B.  It is **never**
+        blocked by AI inference.
+
+        Frame-skipping strategy:
+          If ``frame_queue`` is full, the oldest frame is silently
+          discarded and replaced with the newer one.  This guarantees
+          Thread B always processes the most recent frame.
+
+        Reconnect strategy:
+          On stream failure, retries with exponential backoff
+          (2s → 4s → 8s → … → 30s max).
+        """
+        logger.info(
+            "[Thread-A] Frame grabber started for camera %s (%s)",
+            self.camera_id, self.rtsp_url,
+        )
         update_camera_status(self.camera_id, "processing")
 
         cap: Optional[cv2.VideoCapture] = None
-        retry_delay = 2  # seconds between reconnect attempts (with backoff)
-
-        # Frame broadcast throttle
-        frame_interval = 1.0 / max(settings.FRAME_BROADCAST_FPS, 1)
-        last_frame_broadcast = 0.0
+        retry_delay = 2  # seconds between reconnect attempts
 
         while not self._stop_event.is_set():
             try:
                 cap = cv2.VideoCapture(self.rtsp_url)
                 if not cap.isOpened():
-                    logger.warning("Cannot open stream %s — retrying in %ds", self.rtsp_url, retry_delay)
-                    time.sleep(retry_delay)
+                    logger.warning(
+                        "[Thread-A] Cannot open stream %s — retrying in %ds",
+                        self.rtsp_url, retry_delay,
+                    )
+                    self._stop_event.wait(retry_delay)
                     retry_delay = min(retry_delay * 2, 30)
                     continue
 
                 # Stream opened successfully
                 update_camera_status(self.camera_id, "live")
                 retry_delay = 2
-                last_detect = 0.0
+                logger.info("[Thread-A] Stream opened for camera %s", self.camera_id)
 
                 while not self._stop_event.is_set():
                     ret, frame = cap.read()
                     if not ret:
-                        logger.warning("Lost frame from camera %s", self.camera_id)
+                        logger.warning(
+                            "[Thread-A] Lost frame from camera %s — reconnecting",
+                            self.camera_id,
+                        )
                         break  # will reconnect
 
-                    now = time.time()
-
-                    # ---- Frame broadcast (throttled) ----
-                    if now - last_frame_broadcast >= frame_interval:
-                        last_frame_broadcast = now
-                        self._broadcast_frame(frame)
-
-                    # ---- Detection (interval-gated) ----
-                    if now - last_detect < settings.DETECTION_INTERVAL_SECONDS:
-                        # Skip — not time to detect yet
-                        continue
-
-                    last_detect = now
-                    self._process_frame(frame)
+                    # --------------------------------------------------
+                    # Enqueue frame with frame-skipping semantics:
+                    # If queue is full, drop the oldest frame, put the new one.
+                    # frame.copy() transfers ownership — no shared mutation.
+                    # --------------------------------------------------
+                    frame_copy = frame.copy()
+                    try:
+                        self._frame_queue.put_nowait(frame_copy)
+                    except queue.Full:
+                        # Queue full → drop oldest, insert newest
+                        try:
+                            self._frame_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            self._frame_queue.put_nowait(frame_copy)
+                        except queue.Full:
+                            pass  # extremely unlikely, just skip this frame
 
             except Exception:
-                logger.exception("Stream worker error (camera %s)", self.camera_id)
-                time.sleep(retry_delay)
+                logger.exception(
+                    "[Thread-A] Frame grabber error (camera %s)", self.camera_id,
+                )
+                self._stop_event.wait(retry_delay)
                 retry_delay = min(retry_delay * 2, 30)
             finally:
                 if cap is not None:
                     cap.release()
+                    cap = None
 
-        # Stopped
+        # Thread stopping
         update_camera_status(self.camera_id, "offline")
-        logger.info("Stream worker stopped for camera %s", self.camera_id)
+        logger.info("[Thread-A] Frame grabber stopped for camera %s", self.camera_id)
 
-    # ---- frame broadcast ---------------------------------------------
+    # =================================================================
+    # THREAD B — YOLO + ByteTrack Detection & Tracking
+    # =================================================================
 
-    def _broadcast_frame(self, frame: np.ndarray) -> None:
-        """Encode a frame to base64 JPEG and broadcast via WebSocket."""
-        # Only encode and broadcast if there are WS subscribers
-        if not ws_manager.stream_connections.get(self.camera_id):
-            return
+    def _detection_loop(self) -> None:
+        """Thread B: Fast detection + tracking + frame broadcast.
 
-        try:
-            ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-            if not ret:
-                return
-            frame_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+        Pulls frames from ``frame_queue``, runs YOLOv8n-face + ByteTrack,
+        filters by detection zone, de-duplicates by track_id, broadcasts
+        annotated frames via WebSocket, and enqueues ``AnalysisTask`` for
+        any **new** face track IDs.
 
-            asyncio.run_coroutine_threadsafe(
-                ws_manager.broadcast_frame(self.camera_id, frame_b64),
-                self._loop,
-            )
-        except Exception:
-            logger.exception("Frame broadcast failed for camera %s", self.camera_id)
-
-    # ---- snapshot helper ---------------------------------------------
-
-    def _save_snapshot(self, frame: np.ndarray, bbox: dict) -> str:
-        """Crop a face from the frame and save it as a snapshot.
-
-        Returns:
-            Snapshot URL string (empty string on failure).
-        """
-        x, y, w, h = bbox["x"], bbox["y"], bbox["w"], bbox["h"]
-        y1 = max(0, y)
-        y2 = min(frame.shape[0], y + h)
-        x1 = max(0, x)
-        x2 = min(frame.shape[1], x + w)
-        crop = frame[y1:y2, x1:x2]
-
-        if crop.size == 0:
-            return ""
-
-        try:
-            pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-            buf = io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=85)
-            return upload_snapshot(buf.getvalue(), self.camera_id)
-        except Exception:
-            logger.exception("Snapshot save failed for camera %s", self.camera_id)
-            return ""
-
-    # ---- detection (modern pipeline) ---------------------------------
-
-    def _process_frame(self, frame: np.ndarray) -> None:
-        """Run the detection pipeline on a single frame.
-
-        Dispatches to the modern (YOLO+ByteTrack+InsightFace) or legacy
-        (DeepFace) pipeline depending on model_manager state.
+        This thread does NOT run InsightFace or DeepFace — keeping it fast
+        (~30-80ms on GPU, ~150-300ms on CPU).
         """
         from app.services.model_manager import model_manager
 
-        if model_manager.legacy_mode or self._tracker_model is None:
-            self._process_frame_legacy(frame)
-            return
+        logger.info("[Thread-B] Detector started for camera %s", self.camera_id)
 
-        self._process_frame_modern(frame)
+        # Frame broadcast throttle
+        frame_interval = 1.0 / max(settings.FRAME_BROADCAST_FPS, 1)
+        last_frame_broadcast = 0.0
+
+        while not self._stop_event.is_set():
+            # ---- Pull frame from queue ----
+            try:
+                frame = self._frame_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue  # No frame yet, check stop_event and retry
+
+            # Sentinel check (shutdown signal)
+            if frame is None:
+                break
+
+            now = time.time()
+
+            # ---- Frame broadcast (throttled) ----
+            if now - last_frame_broadcast >= frame_interval:
+                last_frame_broadcast = now
+                self._broadcast_frame(frame)
+
+            # ---- Dispatch to modern or legacy pipeline ----
+            if model_manager.legacy_mode or self._tracker_model is None:
+                self._process_frame_legacy(frame)
+            else:
+                self._process_frame_modern(frame)
+
+        logger.info("[Thread-B] Detector stopped for camera %s", self.camera_id)
 
     def _process_frame_modern(self, frame: np.ndarray) -> None:
-        """Modern pipeline: YOLOv8 detect+track → zone filter → de-dup → analyze."""
+        """Modern pipeline (Thread B): YOLOv8 detect+track → zone filter → dedup → enqueue new faces."""
         from app.services.model_manager import model_manager
 
         # ---- Step 1: Detect + Track (YOLOv8 + ByteTrack) ----
@@ -312,7 +431,7 @@ class StreamWorker:
                 for i, f in enumerate(tracked_faces):
                     f["track_id"] = i
         except Exception:
-            logger.exception("YOLO detect/track failed for camera %s", self.camera_id)
+            logger.exception("[Thread-B] YOLO detect/track failed for camera %s", self.camera_id)
             return
 
         if not tracked_faces:
@@ -337,7 +456,7 @@ class StreamWorker:
             if track_id is not None:
                 last_seen = self._analyzed_tracks.get(track_id)
                 if last_seen is not None and (now - last_seen) < reanalyze_ttl:
-                    # Already analyzed recently — skip
+                    # Already analyzed recently — skip heavy inference
                     continue
                 # Mark as analyzed
                 self._analyzed_tracks[track_id] = now
@@ -354,53 +473,136 @@ class StreamWorker:
         if not new_faces:
             return
 
-        # ---- Step 4: Analyze each new face ----
+        # ---- Step 4: Enqueue new faces for Thread C (heavy inference) ----
         timestamp = datetime.now(timezone.utc).isoformat()
-        faces_payload: list[dict] = []
-        stats_male = 0
-        stats_female = 0
-        dominant_emotion = None
 
         for face_data in new_faces:
             bbox = face_data["bbox"]
 
-            try:
-                # InsightFace: age + gender
-                ag = model_manager.analyze_age_gender(frame, bbox)
+            # Create padded crop for InsightFace (independent copy)
+            x, y, w, h = bbox["x"], bbox["y"], bbox["w"], bbox["h"]
+            pad = int(max(w, h) * 0.15)
+            y1 = max(0, y - pad)
+            y2 = min(frame.shape[0], y + h + pad)
+            x1 = max(0, x - pad)
+            x2 = min(frame.shape[1], x + w + pad)
+            crop = frame[y1:y2, x1:x2].copy()  # Independent copy — no shared state
 
-                # DeepFace: emotion only
-                emo = model_manager.analyze_emotion(frame, bbox)
+            if crop.size == 0:
+                continue
+
+            task = AnalysisTask(
+                camera_id=self.camera_id,
+                frame_crop=crop,
+                full_frame=frame.copy(),  # Independent copy for snapshot
+                bbox=bbox,
+                track_id=face_data.get("track_id", -1),
+                confidence=face_data.get("confidence", 0.0),
+                timestamp=timestamp,
+            )
+
+            try:
+                self._analysis_queue.put_nowait(task)
+            except queue.Full:
+                logger.debug(
+                    "[Thread-B] Analysis queue full — skipping face track_id=%s",
+                    task.track_id,
+                )
+
+    # =================================================================
+    # THREAD C — Heavy Inference Worker
+    # =================================================================
+
+    def _analysis_worker_loop(self) -> None:
+        """Thread C: InsightFace + DeepFace + Snapshot + DB + Alerts.
+
+        Pulls ``AnalysisTask`` items from ``analysis_queue`` and performs
+        the expensive analysis pipeline.  This thread runs **only for
+        new face track IDs** — typically a fraction of all frames —
+        dramatically reducing GPU/CPU load.
+
+        All data arrives as independent copies (no shared mutable state).
+        """
+        from app.services.model_manager import model_manager
+
+        logger.info("[Thread-C] Analysis worker started for camera %s", self.camera_id)
+
+        # Batch accumulator: collect results until we have a "batch" to persist.
+        # In practice, tasks trickle in one at a time, but we batch-persist
+        # to minimize DB round-trips when multiple faces appear simultaneously.
+        batch: list[dict] = []
+        batch_timestamp: Optional[str] = None
+        batch_stats_male = 0
+        batch_stats_female = 0
+        batch_dominant_emotion: Optional[str] = None
+        batch_deadline = 0.0  # flush batch at this time
+
+        BATCH_WINDOW = 0.5  # seconds — wait up to 500ms to batch-collect faces
+
+        while not self._stop_event.is_set():
+            # ---- Pull task from queue ----
+            try:
+                task = self._analysis_queue.get(timeout=0.3)
+            except queue.Empty:
+                # Check if we have a pending batch to flush
+                if batch and time.time() >= batch_deadline:
+                    self._flush_batch(
+                        batch, batch_timestamp,
+                        batch_stats_male, batch_stats_female,
+                        batch_dominant_emotion,
+                    )
+                    batch = []
+                    batch_stats_male = 0
+                    batch_stats_female = 0
+                    batch_dominant_emotion = None
+                continue
+
+            # Sentinel check (shutdown signal)
+            if task is None:
+                break
+
+            # ---- Analyze face ----
+            try:
+                ag = self._analyze_age_gender(model_manager, task.frame_crop)
+                emo = self._analyze_emotion(model_manager, task.frame_crop)
             except Exception:
-                logger.debug("Analysis failed for a face on camera %s", self.camera_id)
+                logger.debug(
+                    "[Thread-C] Analysis failed for track_id=%s on camera %s",
+                    task.track_id, task.camera_id,
+                )
                 ag = {"age": 0, "gender": "unknown"}
                 emo = {"emotion": "neutral"}
 
             age_group = classify_age(ag["age"])
 
-            # Crop & save snapshot
-            snapshot_url = self._save_snapshot(frame, bbox)
+            # ---- Save snapshot (disk I/O — fine in background thread) ----
+            snapshot_url = self._save_snapshot(task.full_frame, task.bbox)
 
             face_dict = {
                 "id": str(uuid.uuid4()),
-                "track_id": face_data.get("track_id"),
-                "bbox": bbox,
+                "track_id": task.track_id,
+                "bbox": task.bbox,
                 "gender": ag["gender"],
                 "emotion": emo["emotion"],
                 "age_group": age_group,
                 "age": ag["age"],
-                "confidence": round(face_data["confidence"], 2),
+                "confidence": round(task.confidence, 2),
                 "snapshot_url": snapshot_url,
             }
-            faces_payload.append(face_dict)
 
-            # Accumulate stats
+            # Accumulate into batch
+            batch.append(face_dict)
+            if batch_timestamp is None:
+                batch_timestamp = task.timestamp
+                batch_deadline = time.time() + BATCH_WINDOW
+
             if ag["gender"] == "male":
-                stats_male += 1
+                batch_stats_male += 1
             else:
-                stats_female += 1
-            dominant_emotion = emo["emotion"]
+                batch_stats_female += 1
+            batch_dominant_emotion = emo["emotion"]
 
-            # Update hourly stats
+            # Update hourly stats (per-face, non-blocking)
             try:
                 gender_val = "Man" if ag["gender"] == "male" else "Woman"
                 upsert_hourly_stats(
@@ -410,15 +612,66 @@ class StreamWorker:
                     age_group=age_group,
                 )
             except Exception:
-                logger.exception("Stats upsert failed for camera %s", self.camera_id)
+                logger.exception("[Thread-C] Stats upsert failed for camera %s", self.camera_id)
 
-        # ---- Step 5: Persist + broadcast ----
-        self._persist_and_broadcast(faces_payload, timestamp, stats_male, stats_female, dominant_emotion)
+            # Auto-flush if batch is large enough
+            if len(batch) >= 5:
+                self._flush_batch(
+                    batch, batch_timestamp,
+                    batch_stats_male, batch_stats_female,
+                    batch_dominant_emotion,
+                )
+                batch = []
+                batch_timestamp = None
+                batch_stats_male = 0
+                batch_stats_female = 0
+                batch_dominant_emotion = None
+
+        # Flush any remaining batch on shutdown
+        if batch:
+            self._flush_batch(
+                batch, batch_timestamp,
+                batch_stats_male, batch_stats_female,
+                batch_dominant_emotion,
+            )
+
+        logger.info("[Thread-C] Analysis worker stopped for camera %s", self.camera_id)
+
+    @staticmethod
+    def _analyze_age_gender(model_manager, crop: np.ndarray) -> dict:
+        """Run InsightFace age/gender on a face crop (with DeepFace fallback)."""
+        return model_manager.analyze_age_gender_from_crop(crop)
+
+    @staticmethod
+    def _analyze_emotion(model_manager, crop: np.ndarray) -> dict:
+        """Run DeepFace emotion analysis on a face crop."""
+        return model_manager.analyze_emotion_from_crop(crop)
+
+    # ---- batch flush (Thread C helper) --------------------------------
+
+    def _flush_batch(
+        self,
+        faces_payload: list[dict],
+        timestamp: Optional[str],
+        stats_male: int,
+        stats_female: int,
+        dominant_emotion: Optional[str],
+    ) -> None:
+        """Persist a batch of analyzed faces and broadcast via WebSocket."""
+        if not faces_payload:
+            return
+
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
+        self._persist_and_broadcast(faces_payload, ts, stats_male, stats_female, dominant_emotion)
 
     # ---- detection (legacy pipeline) ---------------------------------
 
     def _process_frame_legacy(self, frame: np.ndarray) -> None:
-        """Legacy pipeline: DeepFace.analyze() for everything (fallback)."""
+        """Legacy pipeline: DeepFace.analyze() for everything (fallback).
+
+        NOTE: In legacy mode, all processing happens in Thread B since we
+        cannot decouple detection from analysis (DeepFace does everything).
+        """
         try:
             from deepface import DeepFace
 
@@ -429,7 +682,7 @@ class StreamWorker:
                 silent=True,
             )
         except Exception:
-            logger.exception("DeepFace.analyze failed for camera %s", self.camera_id)
+            logger.exception("[Thread-B] DeepFace.analyze failed for camera %s", self.camera_id)
             return
 
         # DeepFace may return a single dict or a list
@@ -453,7 +706,6 @@ class StreamWorker:
             h = region.get("h", 0)
 
             # Skip if the detection bbox is essentially the full frame
-            # (DeepFace returns this when enforce_detection=False and no face found)
             if w <= 0 or h <= 0:
                 continue
 
@@ -502,12 +754,60 @@ class StreamWorker:
                     age_group=age_group,
                 )
             except Exception:
-                logger.exception("Stats upsert failed for camera %s", self.camera_id)
+                logger.exception("[Thread-B] Stats upsert failed for camera %s", self.camera_id)
 
         if not faces_payload:
             return
 
         self._persist_and_broadcast(faces_payload, timestamp, stats_male, stats_female, dominant_emotion)
+
+    # ---- frame broadcast ---------------------------------------------
+
+    def _broadcast_frame(self, frame: np.ndarray) -> None:
+        """Encode a frame to base64 JPEG and broadcast via WebSocket."""
+        # Only encode and broadcast if there are WS subscribers
+        if not ws_manager.stream_connections.get(self.camera_id):
+            return
+
+        try:
+            ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            if not ret:
+                return
+            frame_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+
+            asyncio.run_coroutine_threadsafe(
+                ws_manager.broadcast_frame(self.camera_id, frame_b64),
+                self._loop,
+            )
+        except Exception:
+            logger.exception("Frame broadcast failed for camera %s", self.camera_id)
+
+    # ---- snapshot helper ---------------------------------------------
+
+    def _save_snapshot(self, frame: np.ndarray, bbox: dict) -> str:
+        """Crop a face from the frame and save it as a snapshot.
+
+        Returns:
+            Snapshot URL string (empty string on failure).
+        """
+        x, y, w, h = bbox["x"], bbox["y"], bbox["w"], bbox["h"]
+        y1 = max(0, y)
+        y2 = min(frame.shape[0], y + h)
+        x1 = max(0, x)
+        x2 = min(frame.shape[1], x + w)
+        crop = frame[y1:y2, x1:x2]
+
+        if crop.size == 0:
+            return ""
+
+        try:
+            pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=85)
+            return upload_snapshot(buf.getvalue(), self.camera_id)
+        except Exception:
+            logger.exception("Snapshot save failed for camera %s", self.camera_id)
+            return ""
 
     # ---- shared persist + broadcast ----------------------------------
 

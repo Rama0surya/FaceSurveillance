@@ -391,6 +391,87 @@ class ModelManager:
             return {"emotion": "neutral"}
 
     # -----------------------------------------------------------------
+    # Crop-based analysis (used by multi-thread pipeline Thread C)
+    # -----------------------------------------------------------------
+
+    def analyze_age_gender_from_crop(self, crop: np.ndarray) -> dict:
+        """Analyze age and gender from a pre-cropped face image.
+
+        Same logic as ``analyze_age_gender`` but skips bbox → crop
+        computation (the caller already provides the crop).
+
+        Returns:
+            {"age": int, "gender": str ("male"/"female"/"unknown")}
+        """
+        if crop.size == 0:
+            return {"age": 0, "gender": "unknown"}
+
+        # Primary: InsightFace
+        if self.insight_app is not None:
+            try:
+                with self._insight_lock:
+                    faces = self.insight_app.get(crop)
+                if faces:
+                    face = faces[0]
+                    return {
+                        "age": int(face.age),
+                        "gender": "male" if face.gender == 1 else "female",
+                    }
+            except Exception:
+                logger.debug("InsightFace age/gender failed, trying DeepFace fallback")
+
+        # Fallback: DeepFace
+        try:
+            from deepface import DeepFace
+
+            result = DeepFace.analyze(
+                img_path=crop,
+                actions=["age", "gender"],
+                enforce_detection=False,
+                silent=True,
+                detector_backend=getattr(settings, "FACE_DETECTOR", "opencv"),
+                model_name=getattr(settings, "DEEPFACE_MODEL", "VGG-Face"),
+            )
+            if isinstance(result, list):
+                result = result[0]
+            age = int(result.get("age", 0))
+            gender_raw = result.get("dominant_gender", "Man")
+            gender = "male" if gender_raw == "Man" else "female"
+            return {"age": age, "gender": gender}
+        except Exception:
+            logger.debug("DeepFace age/gender fallback also failed")
+            return {"age": 0, "gender": "unknown"}
+
+    def analyze_emotion_from_crop(self, crop: np.ndarray) -> dict:
+        """Analyze emotion from a pre-cropped face image.
+
+        Same logic as ``analyze_emotion`` but skips bbox → crop
+        computation (the caller already provides the crop).
+
+        Returns:
+            {"emotion": str}
+        """
+        if crop.size == 0:
+            return {"emotion": "neutral"}
+
+        try:
+            from deepface import DeepFace
+
+            result = DeepFace.analyze(
+                img_path=crop,
+                actions=["emotion"],
+                enforce_detection=False,
+                silent=True,
+                detector_backend=getattr(settings, "FACE_DETECTOR", "opencv"),
+            )
+            if isinstance(result, list):
+                result = result[0]
+            return {"emotion": result.get("dominant_emotion", "neutral")}
+        except Exception:
+            logger.debug("DeepFace emotion analysis (from crop) failed")
+            return {"emotion": "neutral"}
+
+    # -----------------------------------------------------------------
     # Legacy full analysis (DeepFace for everything)
     # -----------------------------------------------------------------
 

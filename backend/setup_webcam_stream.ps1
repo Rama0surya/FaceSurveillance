@@ -169,8 +169,10 @@ if ($useIndex) {
 
 # start_webcam_stream.bat
 # Update start_webcam_stream.bat dengan device name yang benar
-$ffmpegExe = "C:\Users\ahmad\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
-$camDevice = "Streaming Webcams"
+# $ffmpegExe = "C:\Users\ahmad\AppData\Local\Microsoft\WinGet\Links\ffmpeg.exe"
+# $camDevice = "Streaming Webcams"
+# Ubah baris perintah FFmpeg di dalam variabel $b1 menjadi seperti ini:
+$b1 += "`"$ffmpegExe`" -f dshow -i $ffInput -vcodec libx264 -preset ultrafast -tune zerolatency -b:v 1500k -maxrate 1500k -bufsize 3000k -pix_fmt yuv420p -g 30 -an -f rtsp -rtsp_transport tcp rtsp://localhost:8554/webcam`r`n"
 
 $b1  = "@echo off`r`n"
 $b1 += "title ffmpeg - Webcam to RTSP`r`n"

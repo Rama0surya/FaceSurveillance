@@ -1,16 +1,22 @@
 """
 System information service — detects hardware, software environment,
 and provides acceleration recommendations.
+
+Includes a background cache that polls hardware info every 60 seconds
+so API responses are instant (~0ms) instead of blocking (~600ms+).
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import platform
 import shutil
 import subprocess
+import threading
 import time
+from typing import Any, Optional
 
 import psutil
 
@@ -19,6 +25,127 @@ logger = logging.getLogger(__name__)
 # Track app start time for uptime calculation
 _start_time = time.time()
 
+
+# =====================================================================
+# Background Cache — thread-safe, auto-refreshing
+# =====================================================================
+
+class _SystemInfoCache:
+    """Thread-safe in-memory cache with background polling.
+
+    Heavy operations (GPU detection, nvidia-smi, torch import) run in a
+    background thread every ``interval`` seconds.  API handlers only read
+    from the cache dict — never call heavy functions directly.
+    """
+
+    def __init__(self, interval: int = 60) -> None:
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._task: Optional[asyncio.Task] = None
+
+        # Cached payloads — split into lightweight vs heavyweight
+        self._cpu_memory: dict[str, Any] = {}
+        self._gpu: dict[str, Any] = {}
+        self._disk: dict[str, Any] = {}
+        self._acceleration: dict[str, Any] = {}
+        self._last_updated: float = 0.0
+
+    # ---- Public read API (called from route handlers) ----
+
+    def get_full_info(self) -> dict:
+        """Return the full cached payload.  Instant, no I/O."""
+        with self._lock:
+            return {
+                "cpu": dict(self._cpu_memory.get("cpu", {})),
+                "memory": dict(self._cpu_memory.get("memory", {})),
+                "gpu": dict(self._gpu),
+                "disk": dict(self._disk),
+                "python": SystemInfo.get_python_info(),
+                "models": SystemInfo.get_model_info(),
+                "acceleration": dict(self._acceleration),
+                "cache_age_seconds": round(time.time() - self._last_updated, 1) if self._last_updated else None,
+            }
+
+    def get_cpu_memory(self) -> dict:
+        with self._lock:
+            return dict(self._cpu_memory)
+
+    def get_gpu(self) -> dict:
+        with self._lock:
+            return dict(self._gpu)
+
+    def get_hardware(self) -> dict:
+        with self._lock:
+            return {
+                "gpu": dict(self._gpu),
+                "cpu": dict(self._cpu_memory.get("cpu", {})),
+            }
+
+    # ---- Lifecycle ----
+
+    def start(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        """Perform an initial synchronous refresh, then schedule the
+        background polling task on the given event loop."""
+        logger.info("SystemInfoCache: initial refresh …")
+        self._refresh()
+        logger.info("SystemInfoCache: initial refresh done (%.0fms)", (time.time() - self._last_updated) * 1000)
+
+        if loop is not None:
+            self._task = loop.create_task(self._poll_loop())
+
+    def stop(self) -> None:
+        if self._task and not self._task.done():
+            self._task.cancel()
+            logger.info("SystemInfoCache: background polling stopped")
+
+    # ---- Background polling ----
+
+    async def _poll_loop(self) -> None:
+        """Async loop that offloads the heavy refresh to a thread."""
+        while True:
+            await asyncio.sleep(self._interval)
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, self._refresh)
+                logger.debug("SystemInfoCache: refreshed (interval=%ds)", self._interval)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("SystemInfoCache: refresh failed, will retry")
+
+    def _refresh(self) -> None:
+        """Collect all hardware data (runs in background thread)."""
+        # Lightweight — CPU & memory (~50ms due to cpu_percent interval)
+        cpu_mem = {
+            "cpu": SystemInfo.get_cpu_info(),
+            "memory": SystemInfo.get_memory_info(),
+        }
+
+        # Heavyweight — GPU detection (~500ms+ due to nvidia-smi / torch)
+        gpu = SystemInfo.get_gpu_info()
+
+        # Lightweight
+        disk = SystemInfo.get_disk_info()
+
+        # Acceleration recommendation (depends on GPU result)
+        accel = SystemInfo._get_acceleration_recommendation_from(gpu)
+
+        # Atomic swap under lock
+        with self._lock:
+            self._cpu_memory = cpu_mem
+            self._gpu = gpu
+            self._disk = disk
+            self._acceleration = accel
+            self._last_updated = time.time()
+
+
+# Singleton instance — imported by routes and lifespan
+system_info_cache = _SystemInfoCache(interval=60)
+
+
+# =====================================================================
+# Raw collection functions (unchanged logic, used by cache refresh)
+# =====================================================================
 
 class SystemInfo:
     """Detect hardware and software environment."""
@@ -141,10 +268,6 @@ class SystemInfo:
             "face_tracker": settings.FACE_TRACKER,
             "detection_interval": settings.DETECTION_INTERVAL_SECONDS,
             "frame_broadcast_fps": settings.FRAME_BROADCAST_FPS,
-            "available_models": ["VGG-Face", "Facenet", "OpenFace", "DeepID", "ArcFace", "Dlib"],
-            "available_detectors": ["opencv", "retinaface", "mtcnn", "ssd", "dlib", "yolov8"],
-            "detection_interval": settings.DETECTION_INTERVAL_SECONDS,
-            "frame_broadcast_fps": settings.FRAME_BROADCAST_FPS,
             "available_models": [
                 "VGG-Face",
                 "Facenet",
@@ -165,7 +288,12 @@ class SystemInfo:
 
     @classmethod
     def get_full_info(cls) -> dict:
-        """Return all system info in a single payload."""
+        """Return all system info in a single payload.
+
+        .. deprecated::
+            Use ``system_info_cache.get_full_info()`` for cached reads.
+            This method is kept for the background refresh worker.
+        """
         return {
             "cpu": cls.get_cpu_info(),
             "memory": cls.get_memory_info(),
@@ -180,7 +308,11 @@ class SystemInfo:
     def _get_acceleration_recommendation(cls) -> dict:
         """Provide hardware acceleration recommendation."""
         gpu = cls.get_gpu_info()
+        return cls._get_acceleration_recommendation_from(gpu)
 
+    @staticmethod
+    def _get_acceleration_recommendation_from(gpu: dict) -> dict:
+        """Build recommendation from a pre-fetched GPU dict (no I/O)."""
         if gpu["cuda_available"]:
             return {
                 "recommended": "CUDA GPU",

@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
-from app.services.system_info import SystemInfo
+from app.services.system_info import SystemInfo, system_info_cache
 
 logger = logging.getLogger(__name__)
 
@@ -25,9 +25,13 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 @router.get("/system-info")
 async def get_system_info():
-    """Return full system information (CPU, Memory, GPU, Disk, Python, Models)."""
+    """Return full system information from background cache.
+
+    Data is refreshed every 60 seconds in a background task.
+    This endpoint returns instantly (~0ms) regardless of GPU probe latency.
+    """
     try:
-        return SystemInfo.get_full_info()
+        return system_info_cache.get_full_info()
     except Exception as exc:
         logger.exception("Failed to get system info")
         raise HTTPException(status_code=500, detail=str(exc))
@@ -35,12 +39,9 @@ async def get_system_info():
 
 @router.get("/hardware")
 async def get_hardware_info():
-    """Return GPU and CPU hardware info."""
+    """Return GPU and CPU hardware info from background cache."""
     try:
-        return {
-            "gpu": SystemInfo.get_gpu_info(),
-            "cpu": SystemInfo.get_cpu_info(),
-        }
+        return system_info_cache.get_hardware()
     except Exception as exc:
         logger.exception("Failed to get hardware info")
         raise HTTPException(status_code=500, detail=str(exc))
