@@ -46,6 +46,7 @@ class Settings(BaseSettings):
 
     MEDIAMTX_API_URL: str = "http://localhost:9997"
     MEDIAMTX_RTSP_URL: str = "rtsp://localhost:8554"
+    MEDIAMTX_HLS_URL: str = "http://localhost:8888" 
     USE_MEDIAMTX: bool = True
 
     @property
