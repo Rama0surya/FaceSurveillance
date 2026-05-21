@@ -262,6 +262,7 @@ useEffect(() => {
       {/* Detection zone editor */}
       {zoneOpen && (
         <DetectionZoneEditor
+          cameraId={camera.id}
           cameraName={camera.name}
           initialPoints={zonePoints}
           onSave={(pts) => {

@@ -113,6 +113,10 @@ class ModelManager:
         # ---- 1. YOLOv8n-face ----
         try:
             from ultralytics import YOLO
+            import torch
+            import ultralytics.nn.tasks as _ult_tasks
+            
+            torch.serialization.add_safe_globals([_ult_tasks.DetectionModel])
 
             model_path = getattr(settings, "YOLO_MODEL_PATH", "yolov8n-face-lindevs.pt")
             self.yolo_model = YOLO(model_path)
@@ -187,6 +191,11 @@ class ModelManager:
 
         try:
             from ultralytics import YOLO
+            import torch
+            import ultralytics.nn.tasks as _ult_tasks
+
+            # Fix PyTorch 2.6 breaking change
+            torch.serialization.add_safe_globals([_ult_tasks.DetectionModel])
 
             model_path = getattr(settings, "YOLO_MODEL_PATH", "yolov8n-face-lindevs.pt")
             tracker = YOLO(model_path)
@@ -333,6 +342,8 @@ class ModelManager:
                 actions=["age", "gender"],
                 enforce_detection=False,
                 silent=True,
+                detector_backend=getattr(settings, "FACE_DETECTOR", "opencv"),
+                model_name=getattr(settings, "DEEPFACE_MODEL", "VGG-Face"),
             )
             if isinstance(result, list):
                 result = result[0]
@@ -367,9 +378,10 @@ class ModelManager:
 
             result = DeepFace.analyze(
                 img_path=crop,
-                actions=["emotion"],  # ONLY emotion — fast
+                actions=["emotion"],
                 enforce_detection=False,
                 silent=True,
+                detector_backend=getattr(settings, "FACE_DETECTOR", "opencv"),
             )
             if isinstance(result, list):
                 result = result[0]
@@ -398,6 +410,8 @@ class ModelManager:
                 actions=["emotion", "age", "gender"],
                 enforce_detection=False,
                 silent=True,
+                detector_backend=getattr(settings, "FACE_DETECTOR", "opencv"),
+                model_name=getattr(settings, "DEEPFACE_MODEL", "VGG-Face"),
             )
             if isinstance(results, dict):
                 results = [results]

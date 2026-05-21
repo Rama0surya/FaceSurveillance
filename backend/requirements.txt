@@ -2,7 +2,6 @@ fastapi==0.111.0
 uvicorn[standard]==0.29.0
 deepface==0.0.93
 opencv-python-headless==4.9.0.80
-supabase==2.4.3
 python-multipart==0.0.9
 python-dotenv==1.0.1
 httpx==0.27.0
@@ -12,7 +11,31 @@ pydantic==2.7.1
 pydantic-settings==2.2.1
 websockets==12.0
 psutil==5.9.8
+
+# YOLO + tracking
 ultralytics>=8.1.0
-insightface>=0.7.3
-onnxruntime-gpu>=1.17.0
 lap>=0.4
+
+# InsightFace (requires C++ build tools on Windows)
+# insightface>=0.7.3
+
+# ONNX Runtime — pilih SALAH SATU:
+# GPU (butuh CUDA):
+onnxruntime-gpu>=1.17.0
+# CPU only (uncomment jika tidak ada GPU):
+# onnxruntime>=1.17.0
+
+# Database
+sqlalchemy==2.0.30
+pymysql==1.1.1
+cryptography>=42.0.0
+
+# TensorFlow + Keras (untuk DeepFace)
+tensorflow==2.19.0
+tf-keras>=2.19.0
+
+# Static file serving
+aiofiles>=23.0.0
+
+# Supabase (opsional, jika masih dipakai)
+# supabase==2.4.3
