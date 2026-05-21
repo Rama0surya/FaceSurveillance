@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     FRAME_QUEUE_SIZE: int = 2       # Thread A → B: small = always-fresh frames
     ANALYSIS_QUEUE_SIZE: int = 10   # Thread B → C: buffer for heavy inference
 
+    # Smart capture filters
+    CAPTURE_MIN_CONFIDENCE: float = 0.65  # Skip YOLO detections below this confidence
+    MIN_FACE_SIZE: int = 60               # Skip faces smaller than NxN pixels
+    CAPTURE_COOLDOWN: float = 5.0         # Seconds between captures of same track_id
+
     SNAPSHOT_STORAGE: str = "local"
     SNAPSHOT_LOCAL_DIR: str = "snapshots"
 

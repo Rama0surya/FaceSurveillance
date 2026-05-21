@@ -194,19 +194,48 @@ export async function fetchModelInfo() {
   return fetchJSON<Record<string, any>>('/api/settings/models');
 }
 
+/* ---- Pipeline Toggles ---- */
+
+export interface PipelineToggles {
+  tracking_enabled: boolean;
+  insightface_enabled: boolean;
+}
+
+export async function fetchPipelineToggles() {
+  return fetchJSON<PipelineToggles>('/api/settings/pipeline-toggles');
+}
+
+export async function updatePipelineToggles(data: Partial<PipelineToggles>) {
+  return mutateJSON<PipelineToggles>('/api/settings/pipeline-toggles', 'PUT', data);
+}
+
+/* ---- Detection Config ---- */
+
 export interface DetectionConfigPayload {
   detection_interval?: number;
   frame_fps?: number;
   deepface_model?: string;
   face_detector?: string;
+  capture_min_confidence?: number;
+  min_face_size?: number;
+  capture_cooldown?: number;
+}
+
+export interface DetectionConfigResponse {
+  detection_interval: number;
+  frame_fps: number;
+  deepface_model: string;
+  face_detector: string;
+  yolo_confidence: number;
+  face_tracker: string;
+  track_reanalyze_ttl: number;
+  capture_min_confidence: number;
+  min_face_size: number;
+  capture_cooldown: number;
 }
 
 export async function updateDetectionConfig(data: DetectionConfigPayload) {
-  return mutateJSON<{
-    detection_interval: number;
-    frame_fps: number;
-    deepface_model: string;
-  }>('/api/settings/detection-config', 'PUT', data);
+  return mutateJSON<DetectionConfigResponse>('/api/settings/detection-config', 'PUT', data);
 }
 
 export async function fetchHealthCheck() {

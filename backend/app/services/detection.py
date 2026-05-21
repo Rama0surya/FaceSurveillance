@@ -14,15 +14,25 @@ Each camera gets its own ``StreamWorker`` with **three decoupled threads**:
 
   Thread B — **YOLO + ByteTrack Detector**
     Pulls frames from ``frame_queue``, runs YOLOv8n-face detection and
-    ByteTrack tracking.  Broadcasts annotated frames to WebSocket clients.
-    When a **new track_id** appears, it packages a lightweight
-    ``AnalysisTask`` (face crop + metadata) and enqueues it for Thread C.
+    (optionally) ByteTrack tracking.  Applies smart capture filters:
+    confidence threshold, minimum face size, and per-track cooldown
+    with emotion-change bypass.  Broadcasts frames to WebSocket clients.
+    When capture criteria are met, enqueues ``AnalysisTask`` for Thread C.
 
   Thread C — **Heavy Inference Worker**
     Pulls ``AnalysisTask`` items from ``analysis_queue``.
     Runs InsightFace (age/gender) + DeepFace (emotion), saves snapshots,
     persists to DB, evaluates alerts, and broadcasts results via WebSocket.
-    This thread is invoked **only for new faces**, saving ~80% GPU/CPU.
+    Can be toggled OFF entirely via pipeline_state for maximum FPS.
+
+Runtime Toggles (via ``pipeline_state``):
+  - ``tracking_enabled``:    ON/OFF ByteTrack in Thread B
+  - ``insightface_enabled``: ON/OFF heavy inference in Thread C
+
+Smart Capture Filters:
+  - Confidence threshold (CAPTURE_MIN_CONFIDENCE)
+  - Minimum face size (MIN_FACE_SIZE)
+  - Per-track cooldown (CAPTURE_COOLDOWN) with emotion-change bypass
 
 Pipeline modes:
   - **Modern** (default): YOLOv8n-face → ByteTrack → InsightFace → DeepFace emotion
@@ -40,7 +50,7 @@ import threading
 import time
 import uuid
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -55,6 +65,7 @@ from app.db.detections import insert_detection, insert_snapshot
 from app.db.stats import upsert_hourly_stats
 from app.db.cameras import update_camera_status, get_camera_raw
 from app.services.alert_engine import alert_engine
+from app.services.pipeline_state import pipeline_state
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +118,22 @@ def _is_face_in_zone(
 
 
 # =====================================================================
+# TrackState — per-track capture state for smart cooldown
+# =====================================================================
+
+@dataclass
+class TrackState:
+    """Mutable state for a tracked face ID.
+
+    Stored in ``StreamWorker._track_state`` and accessed only by the
+    StreamWorker's own threads (Thread B for reads, Thread C for writes),
+    with a lock protecting cross-thread access.
+    """
+    last_capture_time: float = 0.0     # time.time() of last capture
+    last_emotion: str = ""             # emotion string from last analysis
+
+
+# =====================================================================
 # AnalysisTask — immutable work item for Thread C
 # =====================================================================
 
@@ -142,6 +169,9 @@ class StreamWorker:
       - Thread A: RTSP frame grabber  (I/O-bound, never blocked by AI)
       - Thread B: YOLO + ByteTrack    (GPU-bound, fast ~30-80ms)
       - Thread C: Heavy inference      (GPU-bound, slow, only new faces)
+
+    Runtime toggles from ``pipeline_state`` are checked on every iteration,
+    allowing instant ON/OFF of tracking and InsightFace without restart.
     """
 
     def __init__(self, camera_id: str, rtsp_url: str, loop: asyncio.AbstractEventLoop) -> None:
@@ -151,13 +181,9 @@ class StreamWorker:
         self._stop_event = threading.Event()
 
         # ---- Inter-thread queues ----
-        # Frame queue: Thread A → Thread B
-        # Small maxsize ensures Thread B always gets the freshest frame.
         self._frame_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(
             maxsize=max(1, settings.FRAME_QUEUE_SIZE),
         )
-        # Analysis queue: Thread B → Thread C
-        # Larger buffer since Thread C is slower but called less frequently.
         self._analysis_queue: queue.Queue[Optional[AnalysisTask]] = queue.Queue(
             maxsize=max(1, settings.ANALYSIS_QUEUE_SIZE),
         )
@@ -169,11 +195,13 @@ class StreamWorker:
         self._detection_zone: Optional[dict] = None
         self._load_detection_zone()
 
-        # --- Tracking state (modern pipeline) ---
-        self._analyzed_tracks: dict[int, float] = {}  # track_id → timestamp last analyzed
-        self._tracker_model = None  # per-camera YOLO instance for tracking
+        # ---- Smart capture state ----
+        # track_id → TrackState  (shared between Thread B reads & Thread C writes)
+        self._track_state: dict[int, TrackState] = {}
+        self._track_state_lock = threading.Lock()
 
-        # Initialize tracker model if modern pipeline is active
+        # --- Tracker model (modern pipeline) ---
+        self._tracker_model = None
         self._init_tracker()
 
     def _init_tracker(self) -> None:
@@ -267,6 +295,57 @@ class StreamWorker:
                 q.get_nowait()
             except queue.Empty:
                 break
+
+    # ---- TrackState helpers (thread-safe) -----------------------------
+
+    def _get_track_state(self, track_id: int) -> Optional[TrackState]:
+        """Read TrackState for a given track_id (thread-safe)."""
+        with self._track_state_lock:
+            return self._track_state.get(track_id)
+
+    def _set_track_capture(self, track_id: int, emotion: str) -> None:
+        """Record a capture event for a track_id (thread-safe).
+
+        Called by Thread C after successful analysis.
+        """
+        with self._track_state_lock:
+            state = self._track_state.get(track_id)
+            if state is None:
+                self._track_state[track_id] = TrackState(
+                    last_capture_time=time.time(),
+                    last_emotion=emotion,
+                )
+            else:
+                state.last_capture_time = time.time()
+                state.last_emotion = emotion
+
+    def _mark_track_pending(self, track_id: int) -> None:
+        """Mark a track_id as pending capture (Thread B).
+
+        Sets last_capture_time so subsequent checks don't re-enqueue
+        while Thread C is still processing.
+        """
+        with self._track_state_lock:
+            state = self._track_state.get(track_id)
+            if state is None:
+                self._track_state[track_id] = TrackState(
+                    last_capture_time=time.time(),
+                    last_emotion="",
+                )
+            else:
+                state.last_capture_time = time.time()
+
+    def _cleanup_stale_tracks(self, max_age: float = 60.0) -> None:
+        """Remove track states older than max_age seconds."""
+        with self._track_state_lock:
+            if len(self._track_state) <= 200:
+                return  # not worth cleaning yet
+            now = time.time()
+            cutoff = now - max_age
+            self._track_state = {
+                tid: s for tid, s in self._track_state.items()
+                if s.last_capture_time > cutoff
+            }
 
     # =================================================================
     # THREAD A — RTSP Frame Grabber
@@ -364,13 +443,18 @@ class StreamWorker:
     def _detection_loop(self) -> None:
         """Thread B: Fast detection + tracking + frame broadcast.
 
-        Pulls frames from ``frame_queue``, runs YOLOv8n-face + ByteTrack,
-        filters by detection zone, de-duplicates by track_id, broadcasts
-        annotated frames via WebSocket, and enqueues ``AnalysisTask`` for
-        any **new** face track IDs.
+        Pulls frames from ``frame_queue``, runs YOLOv8n-face + (optionally)
+        ByteTrack, applies smart capture filters, broadcasts annotated
+        frames via WebSocket, and enqueues ``AnalysisTask`` for new faces.
 
-        This thread does NOT run InsightFace or DeepFace — keeping it fast
-        (~30-80ms on GPU, ~150-300ms on CPU).
+        Detection is throttled by ``DETECTION_INTERVAL_SECONDS`` to prevent
+        over-detection (30+ YOLO calls/sec).  Frame broadcast is NOT
+        throttled by this — it runs on every eligible tick so the live
+        video stream stays smooth.
+
+        Toggle-aware:
+          - ``pipeline_state.tracking_enabled == False`` → skip ByteTrack
+          - ``pipeline_state.insightface_enabled == False`` → skip enqueue
         """
         from app.services.model_manager import model_manager
 
@@ -379,6 +463,9 @@ class StreamWorker:
         # Frame broadcast throttle
         frame_interval = 1.0 / max(settings.FRAME_BROADCAST_FPS, 1)
         last_frame_broadcast = 0.0
+
+        # Detection throttle — prevent running YOLO on every single frame
+        last_detection = 0.0
 
         while not self._stop_event.is_set():
             # ---- Pull frame from queue ----
@@ -393,10 +480,17 @@ class StreamWorker:
 
             now = time.time()
 
-            # ---- Frame broadcast (throttled) ----
+            # ---- Frame broadcast (throttled by FPS, NOT by detection interval) ----
             if now - last_frame_broadcast >= frame_interval:
                 last_frame_broadcast = now
                 self._broadcast_frame(frame)
+
+            # ---- Detection interval gate ----
+            # Only run AI detection every DETECTION_INTERVAL_SECONDS.
+            # This prevents over-detection while keeping stream smooth.
+            if now - last_detection < settings.DETECTION_INTERVAL_SECONDS:
+                continue
+            last_detection = now
 
             # ---- Dispatch to modern or legacy pipeline ----
             if model_manager.legacy_mode or self._tracker_model is None:
@@ -407,16 +501,37 @@ class StreamWorker:
         logger.info("[Thread-B] Detector stopped for camera %s", self.camera_id)
 
     def _process_frame_modern(self, frame: np.ndarray) -> None:
-        """Modern pipeline (Thread B): YOLOv8 detect+track → zone filter → dedup → enqueue new faces."""
+        """Modern pipeline (Thread B): detect → filter → smart capture → enqueue.
+
+        Smart capture filter chain:
+          1. YOLO confidence ≥ CAPTURE_MIN_CONFIDENCE
+          2. Face bbox ≥ MIN_FACE_SIZE × MIN_FACE_SIZE pixels
+          3. Detection zone check
+          4. Per-track cooldown (CAPTURE_COOLDOWN) with emotion-change bypass
+
+        Toggle-aware:
+          - tracking_enabled OFF → YOLO detection only (no ByteTrack)
+          - insightface_enabled OFF → skip enqueue entirely (no Thread C work)
+        """
         from app.services.model_manager import model_manager
 
-        # ---- Step 1: Detect + Track (YOLOv8 + ByteTrack) ----
+        # ---- Read runtime toggles (instant, no restart needed) ----
+        tracking_on = pipeline_state.tracking_enabled
+        analysis_on = pipeline_state.insightface_enabled
+
+        # ---- Read smart capture thresholds ----
+        min_confidence = settings.CAPTURE_MIN_CONFIDENCE
+        min_face_size = settings.MIN_FACE_SIZE
+        capture_cooldown = settings.CAPTURE_COOLDOWN
+
+        # ---- Step 1: Detect (+Track if enabled) ----
         tracker_cfg = getattr(settings, "FACE_TRACKER", "bytetrack")
         tracker_yaml = f"{tracker_cfg}.yaml" if tracker_cfg != "none" else None
         yolo_conf = getattr(settings, "YOLO_CONFIDENCE", 0.5)
 
         try:
-            if tracker_yaml:
+            if tracking_on and tracker_yaml:
+                # ByteTrack enabled — full detect + track
                 tracked_faces = model_manager.detect_and_track(
                     self._tracker_model,
                     frame,
@@ -425,9 +540,9 @@ class StreamWorker:
                     persist=True,
                 )
             else:
-                # No tracking — detection only
+                # Tracking disabled OR no tracker config — detection only
                 tracked_faces = model_manager.detect_faces_yolo(frame, conf=yolo_conf)
-                # Add dummy track_id
+                # Assign sequential IDs (no persistent tracking)
                 for i, f in enumerate(tracked_faces):
                     f["track_id"] = i
         except Exception:
@@ -437,7 +552,25 @@ class StreamWorker:
         if not tracked_faces:
             return
 
-        # ---- Step 2: Filter by detection zone ----
+        # ---- Step 2: Confidence filter (anti-false-positive) ----
+        tracked_faces = [
+            f for f in tracked_faces
+            if f.get("confidence", 0) >= min_confidence
+        ]
+
+        if not tracked_faces:
+            return
+
+        # ---- Step 3: Face size filter (anti-background) ----
+        tracked_faces = [
+            f for f in tracked_faces
+            if f["bbox"]["w"] >= min_face_size and f["bbox"]["h"] >= min_face_size
+        ]
+
+        if not tracked_faces:
+            return
+
+        # ---- Step 4: Detection zone filter ----
         tracked_faces = [
             f for f in tracked_faces
             if _is_face_in_zone(f["bbox"], self._detection_zone)
@@ -446,37 +579,56 @@ class StreamWorker:
         if not tracked_faces:
             return
 
-        # ---- Step 3: De-duplicate using track_id ----
+        # ---- Step 5: If InsightFace is OFF, stop here (no capture) ----
+        if not analysis_on:
+            return
+
+        # ---- Step 6: Smart cooldown + emotion-change bypass ----
         now = time.time()
-        reanalyze_ttl = getattr(settings, "TRACK_REANALYZE_TTL", 300)
-        new_faces = []
+        faces_to_capture: list[dict] = []
 
         for face in tracked_faces:
             track_id = face.get("track_id")
-            if track_id is not None:
-                last_seen = self._analyzed_tracks.get(track_id)
-                if last_seen is not None and (now - last_seen) < reanalyze_ttl:
-                    # Already analyzed recently — skip heavy inference
-                    continue
-                # Mark as analyzed
-                self._analyzed_tracks[track_id] = now
-            new_faces.append(face)
 
-        # Cleanup stale tracks (keep entries from the last TTL*2 window)
-        if len(self._analyzed_tracks) > 500:
-            cutoff = now - (reanalyze_ttl * 2)
-            self._analyzed_tracks = {
-                tid: ts for tid, ts in self._analyzed_tracks.items()
-                if ts > cutoff
-            }
+            if track_id is not None and tracking_on:
+                state = self._get_track_state(track_id)
 
-        if not new_faces:
+                if state is not None:
+                    time_since_last = now - state.last_capture_time
+
+                    if time_since_last < capture_cooldown:
+                        # Within cooldown window — only capture if we could
+                        # detect an emotion change. But Thread B doesn't know
+                        # the NEW emotion yet (that's Thread C's job).
+                        #
+                        # Strategy: We let Thread C handle emotion comparison.
+                        # Thread B simply enforces the time cooldown.
+                        # When Thread C detects a NEW emotion that differs from
+                        # last_emotion, it updates TrackState immediately,
+                        # effectively resetting the cooldown window for the
+                        # NEXT capture.
+                        #
+                        # This means: within cooldown, same person is NOT
+                        # re-captured. After cooldown expires, person IS
+                        # re-captured, and if emotion changed, the cycle
+                        # continues at normal rate.
+                        continue
+
+                # Either new track or cooldown expired → capture
+                self._mark_track_pending(track_id)
+
+            faces_to_capture.append(face)
+
+        # Periodic cleanup of stale track states
+        self._cleanup_stale_tracks(max_age=max(capture_cooldown * 12, 60.0))
+
+        if not faces_to_capture:
             return
 
-        # ---- Step 4: Enqueue new faces for Thread C (heavy inference) ----
+        # ---- Step 7: Enqueue faces for Thread C (heavy inference) ----
         timestamp = datetime.now(timezone.utc).isoformat()
 
-        for face_data in new_faces:
+        for face_data in faces_to_capture:
             bbox = face_data["bbox"]
 
             # Create padded crop for InsightFace (independent copy)
@@ -518,24 +670,29 @@ class StreamWorker:
 
         Pulls ``AnalysisTask`` items from ``analysis_queue`` and performs
         the expensive analysis pipeline.  This thread runs **only for
-        new face track IDs** — typically a fraction of all frames —
-        dramatically reducing GPU/CPU load.
+        faces that passed smart capture filters** in Thread B.
 
-        All data arrives as independent copies (no shared mutable state).
+        Toggle-aware:
+          If ``pipeline_state.insightface_enabled == False``, this thread
+          drains the queue but does NOT run any inference or I/O —
+          effectively idling and freeing GPU resources.
+
+        Emotion-change tracking:
+          After analysis, updates ``_track_state[track_id].last_emotion``
+          so that Thread B's cooldown logic can detect emotion changes
+          on the next capture cycle.
         """
         from app.services.model_manager import model_manager
 
         logger.info("[Thread-C] Analysis worker started for camera %s", self.camera_id)
 
-        # Batch accumulator: collect results until we have a "batch" to persist.
-        # In practice, tasks trickle in one at a time, but we batch-persist
-        # to minimize DB round-trips when multiple faces appear simultaneously.
+        # Batch accumulator
         batch: list[dict] = []
         batch_timestamp: Optional[str] = None
         batch_stats_male = 0
         batch_stats_female = 0
         batch_dominant_emotion: Optional[str] = None
-        batch_deadline = 0.0  # flush batch at this time
+        batch_deadline = 0.0
 
         BATCH_WINDOW = 0.5  # seconds — wait up to 500ms to batch-collect faces
 
@@ -561,6 +718,10 @@ class StreamWorker:
             if task is None:
                 break
 
+            # ---- Toggle check: if InsightFace is OFF, discard task ----
+            if not pipeline_state.insightface_enabled:
+                continue
+
             # ---- Analyze face ----
             try:
                 ag = self._analyze_age_gender(model_manager, task.frame_crop)
@@ -573,6 +734,24 @@ class StreamWorker:
                 ag = {"age": 0, "gender": "unknown"}
                 emo = {"emotion": "neutral"}
 
+            new_emotion = emo["emotion"]
+
+            # ---- Emotion-change check (smart capture bypass) ----
+            # If the emotion is the SAME as last time AND we're within
+            # an extended cooldown, skip this capture entirely.
+            # This prevents redundant snapshots of the same expression.
+            if task.track_id >= 0:
+                prev_state = self._get_track_state(task.track_id)
+                if prev_state and prev_state.last_emotion:
+                    time_since = time.time() - prev_state.last_capture_time
+                    if (new_emotion == prev_state.last_emotion
+                            and time_since < settings.CAPTURE_COOLDOWN):
+                        # Same emotion within cooldown — skip capture
+                        continue
+
+                # Update track state with new emotion (thread-safe)
+                self._set_track_capture(task.track_id, new_emotion)
+
             age_group = classify_age(ag["age"])
 
             # ---- Save snapshot (disk I/O — fine in background thread) ----
@@ -583,7 +762,7 @@ class StreamWorker:
                 "track_id": task.track_id,
                 "bbox": task.bbox,
                 "gender": ag["gender"],
-                "emotion": emo["emotion"],
+                "emotion": new_emotion,
                 "age_group": age_group,
                 "age": ag["age"],
                 "confidence": round(task.confidence, 2),
@@ -600,7 +779,7 @@ class StreamWorker:
                 batch_stats_male += 1
             else:
                 batch_stats_female += 1
-            batch_dominant_emotion = emo["emotion"]
+            batch_dominant_emotion = new_emotion
 
             # Update hourly stats (per-face, non-blocking)
             try:
@@ -608,7 +787,7 @@ class StreamWorker:
                 upsert_hourly_stats(
                     camera_id=self.camera_id,
                     gender=gender_val,
-                    emotion=emo["emotion"],
+                    emotion=new_emotion,
                     age_group=age_group,
                 )
             except Exception:
@@ -671,7 +850,18 @@ class StreamWorker:
 
         NOTE: In legacy mode, all processing happens in Thread B since we
         cannot decouple detection from analysis (DeepFace does everything).
+
+        Toggle-aware:
+          - ``insightface_enabled == False`` → skip entirely (no analysis)
+        Smart capture filters:
+          - Face size filter (MIN_FACE_SIZE)
+          - Confidence filter (CAPTURE_MIN_CONFIDENCE)
+          - Detection zone filter
         """
+        # ---- Toggle check: if InsightFace/analysis is OFF, skip entirely ----
+        if not pipeline_state.insightface_enabled:
+            return
+
         try:
             from deepface import DeepFace
 
@@ -692,6 +882,10 @@ class StreamWorker:
         if not results:
             return
 
+        # ---- Read smart capture thresholds ----
+        min_face_size = settings.MIN_FACE_SIZE
+        min_confidence = settings.CAPTURE_MIN_CONFIDENCE
+
         timestamp = datetime.now(timezone.utc).isoformat()
         faces_payload: list[dict] = []
         stats_male = 0
@@ -709,6 +903,16 @@ class StreamWorker:
             if w <= 0 or h <= 0:
                 continue
 
+            # ---- Face size filter (anti-background) ----
+            if w < min_face_size or h < min_face_size:
+                continue
+
+            confidence = face_result.get("face_confidence", 0.0)
+
+            # ---- Confidence filter (anti-false-positive) ----
+            if confidence and confidence < min_confidence:
+                continue
+
             # ---- Detection zone filtering ----
             if not _is_face_in_zone(region, self._detection_zone):
                 continue
@@ -718,7 +922,6 @@ class StreamWorker:
 
             dominant_emotion_val = face_result.get("dominant_emotion", "neutral")
             gender_val = face_result.get("dominant_gender", "Man")
-            confidence = face_result.get("face_confidence", 0.0)
 
             # Crop & save snapshot
             bbox = {"x": x, "y": y, "w": w, "h": h}

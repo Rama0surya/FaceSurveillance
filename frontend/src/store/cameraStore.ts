@@ -119,6 +119,12 @@ export interface ZonePoint {
 /** Active page enum */
 export type ActivePage = 'dashboard' | 'cameras' | 'analytics' | 'snapshots' | 'alerts' | 'settings';
 
+/** Pipeline toggle state (synced with backend) */
+export interface PipelineToggles {
+  tracking_enabled: boolean;
+  insightface_enabled: boolean;
+}
+
 /* ------------------------------------------------------------------ */
 /* Store                                                               */
 /* ------------------------------------------------------------------ */
@@ -147,6 +153,9 @@ interface CameraStore {
 
   /** Detection-zone coordinates keyed by camera id */
   detectionZones: Record<string, ZonePoint[]>;
+
+  /** Pipeline model toggles (tracking ON/OFF, analysis ON/OFF) */
+  pipelineToggles: PipelineToggles;
 
   /* Actions */
   setCameras: (cameras: Camera[]) => void;
@@ -190,6 +199,9 @@ interface CameraStore {
   /* Detection zones */
   setDetectionZone: (cameraId: string, points: ZonePoint[]) => void;
   clearDetectionZone: (cameraId: string) => void;
+
+  /* Pipeline toggles */
+  setPipelineToggles: (toggles: PipelineToggles) => void;
 }
 
 const initialStats: TodayStats = {
@@ -220,6 +232,7 @@ export const useCameraStore = create<CameraStore>((set) => ({
 
   activePage: 'dashboard',
   detectionZones: {},
+  pipelineToggles: { tracking_enabled: true, insightface_enabled: true },
 
   /* ---- Actions ---- */
 
@@ -336,4 +349,9 @@ export const useCameraStore = create<CameraStore>((set) => ({
       delete zones[cameraId];
       return { detectionZones: zones };
     }),
+
+  /* ---- Pipeline toggles ---- */
+
+  setPipelineToggles: (toggles) =>
+    set({ pipelineToggles: toggles }),
 }));

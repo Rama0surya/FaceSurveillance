@@ -4834,3 +4834,183 @@
 }
 
 
+/* ================================================================= */
+/* Pipeline Control Panel                                              */
+/* ================================================================= */
+
+.pipeline-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 20px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.pipeline-toggle-row:hover {
+  border-color: rgba(37, 99, 235, 0.3);
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.06);
+}
+
+.pipeline-toggle-row__icon {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+
+.pipeline-toggle-row__icon--blue { background: #DBEAFE; color: #2563EB; }
+.pipeline-toggle-row__icon--purple { background: #EDE9FE; color: #7C3AED; }
+.pipeline-toggle-row__icon--emerald { background: #D1FAE5; color: #059669; }
+
+.pipeline-toggle-row__info {
+  flex: 1;
+  min-width: 0;
+}
+
+.pipeline-toggle-row__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pipeline-toggle-row__hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 2px;
+  line-height: 1.4;
+}
+
+/* Status badge in toggle row */
+.pipeline-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.pipeline-badge--on {
+  background: #DCFCE7;
+  color: #16A34A;
+}
+
+.pipeline-badge--off {
+  background: #FEE2E2;
+  color: #DC2626;
+}
+
+/* Warning banner when InsightFace is OFF */
+.pipeline-warning-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  background: linear-gradient(135deg, #FEF3C7, #FDE68A);
+  border: 1px solid #F59E0B;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #92400E;
+  animation: fade-in 0.3s ease;
+}
+
+.pipeline-warning-banner svg {
+  flex-shrink: 0;
+  color: #D97706;
+}
+
+/* Smart capture config section */
+.pipeline-capture-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+@media (max-width: 768px) {
+  .pipeline-capture-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ================================================================= */
+/* Stream Overlay — Status Indicators                                  */
+/* ================================================================= */
+
+.stream-indicators {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 6px;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.stream-indicator {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: 'Inter', sans-serif;
+  letter-spacing: 0.3px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.stream-indicator--on {
+  background: rgba(22, 163, 74, 0.85);
+  color: #fff;
+}
+
+.stream-indicator--off {
+  background: rgba(220, 38, 38, 0.85);
+  color: #fff;
+}
+
+.stream-indicator__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* Warning bar when analysis is OFF — overlays the video */
+.stream-warning-bar {
+  position: absolute;
+  top: 32px;
+  left: 8px;
+  right: 8px;
+  padding: 6px 12px;
+  background: rgba(220, 38, 38, 0.88);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+  border-radius: 6px;
+  z-index: 10;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  animation: fade-in 0.3s ease;
+  pointer-events: none;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}

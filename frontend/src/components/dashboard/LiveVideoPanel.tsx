@@ -39,6 +39,7 @@ export default function LiveVideoPanel() {
   const currentFaces = useCameraStore((s) => s.currentFaces);
   const activeCamera = useCameraStore((s) => s.activeCamera);
   const isLive = useCameraStore((s) => s.isLive);
+  const pipelineToggles = useCameraStore((s) => s.pipelineToggles);
 
   const timestamp = useMemo(() => {
     return new Date().toLocaleString('en-GB', {
@@ -90,6 +91,25 @@ export default function LiveVideoPanel() {
               <BoundingBox key={face.id} face={face} />
             ))}
           </svg>
+        )}
+
+        {/* Pipeline status indicators — top-right */}
+        <div className="stream-indicators">
+          <span className={`stream-indicator ${pipelineToggles.tracking_enabled ? 'stream-indicator--on' : 'stream-indicator--off'}`}>
+            <span className="stream-indicator__dot" />
+            T
+          </span>
+          <span className={`stream-indicator ${pipelineToggles.insightface_enabled ? 'stream-indicator--on' : 'stream-indicator--off'}`}>
+            <span className="stream-indicator__dot" />
+            A
+          </span>
+        </div>
+
+        {/* Warning bar when face analysis is OFF */}
+        {!pipelineToggles.insightface_enabled && currentFrame && (
+          <div className="stream-warning-bar">
+            ⚠️ Face analysis is disabled — no age/gender/emotion detection
+          </div>
         )}
 
         {/* Timestamp overlay — top-left */}

@@ -1,6 +1,6 @@
 /**
  * SettingsPage — System settings with vertical tab navigation.
- * Tabs: System Info, Model Config, Stream Settings, Storage, About
+ * Tabs: System Info, Pipeline Control, Model Config, Stream Settings, Storage, About
  */
 
 import { useState, useEffect, useCallback } from 'react';
@@ -8,20 +8,24 @@ import {
   Cpu, HardDrive, Monitor, Zap, Server, Info,
   Settings, Sliders, Radio, Database, RefreshCw,
   Check, AlertTriangle, XCircle, ChevronRight,
-  Github, FileText, Shield,
+  Github, FileText, Shield, Crosshair, Eye, Target,
 } from 'lucide-react';
 import {
   fetchSystemInfo,
   updateDetectionConfig,
   fetchHealthCheck,
+  fetchPipelineToggles,
+  updatePipelineToggles,
 } from '@/lib/api';
+import { useCameraStore } from '@/store/cameraStore';
 
-type TabId = 'system' | 'models' | 'stream' | 'storage' | 'about';
+type TabId = 'system' | 'pipeline' | 'models' | 'stream' | 'storage' | 'about';
 
 interface TabItem { id: TabId; icon: React.ElementType; label: string; }
 
 const TABS: TabItem[] = [
   { id: 'system', icon: Monitor, label: 'System Info' },
+  { id: 'pipeline', icon: Zap, label: 'Pipeline Control' },
   { id: 'models', icon: Sliders, label: 'Model Configuration' },
   { id: 'stream', icon: Radio, label: 'Stream Settings' },
   { id: 'storage', icon: Database, label: 'Storage' },
@@ -70,6 +74,18 @@ export default function SettingsPage() {
   const [storageMode, setStorageMode] = useState('local');
   const [snapshotDir, setSnapshotDir] = useState('snapshots');
 
+  // Pipeline toggles (synced with Zustand store)
+  const pipelineToggles = useCameraStore((s) => s.pipelineToggles);
+  const setPipelineToggles = useCameraStore((s) => s.setPipelineToggles);
+  const [toggleLoading, setToggleLoading] = useState(false);
+
+  // Smart capture config
+  const [captureConfidence, setCaptureConfidence] = useState(0.65);
+  const [minFaceSize, setMinFaceSize] = useState(60);
+  const [captureCooldown, setCaptureCooldown] = useState(5.0);
+  const [captureSaving, setCaptureSaving] = useState(false);
+  const [captureSaveMsg, setCaptureSaveMsg] = useState('');
+
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
@@ -99,7 +115,17 @@ export default function SettingsPage() {
     }
   }, []);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  // Load pipeline toggles from backend on mount
+  const loadToggles = useCallback(async () => {
+    try {
+      const state = await fetchPipelineToggles();
+      setPipelineToggles(state);
+    } catch {
+      // Silent — keep defaults
+    }
+  }, [setPipelineToggles]);
+
+  useEffect(() => { loadData(); loadToggles(); }, [loadData, loadToggles]);
 
   // Auto-refresh CPU/Memory every 10s when on system tab
   useEffect(() => {
@@ -113,6 +139,17 @@ export default function SettingsPage() {
     return () => clearInterval(id);
   }, [activeTab]);
 
+  // Poll pipeline toggles every 30s for sync
+  useEffect(() => {
+    const id = window.setInterval(async () => {
+      try {
+        const state = await fetchPipelineToggles();
+        setPipelineToggles(state);
+      } catch { /* silent */ }
+    }, 30_000);
+    return () => clearInterval(id);
+  }, [setPipelineToggles]);
+
   async function handleApplyConfig() {
     setSaving(true);
     setSaveMsg('');
@@ -121,7 +158,7 @@ export default function SettingsPage() {
         detection_interval: interval, 
         frame_fps: fps, 
         deepface_model: model,
-        face_detector: detector,   // ← tambah ini
+        face_detector: detector,
       });
       setSaveMsg('Configuration saved successfully!');
       setTimeout(() => setSaveMsg(''), 3000);
@@ -131,6 +168,51 @@ export default function SettingsPage() {
 
   function handleResetDefaults() {
     setModel('VGG-Face'); setDetector('opencv'); setInterval_(2.0); setFps(5);
+  }
+
+  /** Toggle handler — optimistic update with rollback on error. */
+  async function handleToggle(field: 'tracking_enabled' | 'insightface_enabled') {
+    const previous = { ...pipelineToggles };
+    const newVal = !pipelineToggles[field];
+
+    // Optimistic update
+    setPipelineToggles({ ...pipelineToggles, [field]: newVal });
+    setToggleLoading(true);
+
+    try {
+      const result = await updatePipelineToggles({ [field]: newVal });
+      setPipelineToggles(result);
+    } catch {
+      // Rollback on error
+      setPipelineToggles(previous);
+    } finally {
+      setToggleLoading(false);
+    }
+  }
+
+  /** Save smart capture config. */
+  async function handleSaveCaptureConfig() {
+    setCaptureSaving(true);
+    setCaptureSaveMsg('');
+    try {
+      await updateDetectionConfig({
+        capture_min_confidence: captureConfidence,
+        min_face_size: minFaceSize,
+        capture_cooldown: captureCooldown,
+      });
+      setCaptureSaveMsg('Capture config saved!');
+      setTimeout(() => setCaptureSaveMsg(''), 3000);
+    } catch {
+      setCaptureSaveMsg('Failed to save capture config.');
+    } finally {
+      setCaptureSaving(false);
+    }
+  }
+
+  function handleResetCaptureDefaults() {
+    setCaptureConfidence(0.65);
+    setMinFaceSize(60);
+    setCaptureCooldown(5.0);
   }
 
   const cpu = sysInfo?.cpu;
@@ -240,6 +322,165 @@ export default function SettingsPage() {
             <div className="sett-env-row"><span>ONNX Providers</span><span>{gpu?.onnx_providers?.join(', ') || 'N/A'}</span></div>
             <div className="sett-env-row"><span>GPU Driver</span><span>{gpu?.driver_version || 'N/A'}</span></div>
             <div className="sett-env-row"><span>CUDA Version</span><span>{gpu?.cuda_version || 'N/A'}</span></div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ---- Pipeline Control Tab ---- */
+  function renderPipelineConfig() {
+    return (
+      <div className="sett-tab-content">
+        {/* Model Toggles */}
+        <div className="sett-card">
+          <div className="sett-card__header"><Zap size={16} /> Pipeline Toggles</div>
+
+          {/* Tracking toggle */}
+          <div className="pipeline-toggle-row" style={{ marginBottom: 12 }}>
+            <div className="pipeline-toggle-row__icon pipeline-toggle-row__icon--blue">
+              <Crosshair size={20} />
+            </div>
+            <div className="pipeline-toggle-row__info">
+              <div className="pipeline-toggle-row__title">
+                Tracking (ByteTrack)
+                <span className={`pipeline-badge ${pipelineToggles.tracking_enabled ? 'pipeline-badge--on' : 'pipeline-badge--off'}`}>
+                  {pipelineToggles.tracking_enabled ? 'ON' : 'OFF'}
+                </span>
+              </div>
+              <div className="pipeline-toggle-row__hint">
+                Matikan untuk menghemat CPU. Deteksi tetap berjalan tanpa track_id.
+              </div>
+            </div>
+            <button
+              className={`sett-toggle ${pipelineToggles.tracking_enabled ? 'sett-toggle--on' : ''}`}
+              onClick={() => handleToggle('tracking_enabled')}
+              disabled={toggleLoading}
+              id="toggle-tracking"
+            >
+              <span className="sett-toggle__knob" />
+            </button>
+          </div>
+
+          {/* InsightFace toggle */}
+          <div className="pipeline-toggle-row">
+            <div className="pipeline-toggle-row__icon pipeline-toggle-row__icon--purple">
+              <Eye size={20} />
+            </div>
+            <div className="pipeline-toggle-row__info">
+              <div className="pipeline-toggle-row__title">
+                Face Analysis (InsightFace)
+                <span className={`pipeline-badge ${pipelineToggles.insightface_enabled ? 'pipeline-badge--on' : 'pipeline-badge--off'}`}>
+                  {pipelineToggles.insightface_enabled ? 'ON' : 'OFF'}
+                </span>
+              </div>
+              <div className="pipeline-toggle-row__hint">
+                Matikan untuk boost FPS drastis. Tidak ada analisis usia/gender/ekspresi.
+              </div>
+            </div>
+            <button
+              className={`sett-toggle ${pipelineToggles.insightface_enabled ? 'sett-toggle--on' : ''}`}
+              onClick={() => handleToggle('insightface_enabled')}
+              disabled={toggleLoading}
+              id="toggle-insightface"
+            >
+              <span className="sett-toggle__knob" />
+            </button>
+          </div>
+
+          {/* Warning when analysis is OFF */}
+          {!pipelineToggles.insightface_enabled && (
+            <div className="pipeline-warning-banner" style={{ marginTop: 12 }}>
+              <AlertTriangle size={16} />
+              Face Analysis dinonaktifkan — GPU dibebaskan, tapi tidak ada data snapshot, usia, gender, atau ekspresi.
+            </div>
+          )}
+        </div>
+
+        {/* Smart Capture Filters */}
+        <div className="sett-card">
+          <div className="sett-card__header"><Target size={16} /> Auto-Capture Filters</div>
+
+          <div className="pipeline-capture-grid">
+            {/* Confidence threshold */}
+            <div className="sett-form-group">
+              <label className="sett-label">Min Confidence: <strong>{captureConfidence.toFixed(2)}</strong></label>
+              <input
+                type="range"
+                className="sett-slider"
+                min={0.1}
+                max={1.0}
+                step={0.05}
+                value={captureConfidence}
+                onChange={(e) => setCaptureConfidence(parseFloat(e.target.value))}
+              />
+              <div className="sett-slider-labels"><span>0.10</span><span>1.00</span></div>
+              <p className="sett-hint">Wajah dengan confidence YOLO di bawah nilai ini akan diabaikan (anti-false-positive)</p>
+            </div>
+
+            {/* Min face size */}
+            <div className="sett-form-group">
+              <label className="sett-label">Min Face Size: <strong>{minFaceSize}px</strong></label>
+              <input
+                type="range"
+                className="sett-slider"
+                min={20}
+                max={200}
+                step={10}
+                value={minFaceSize}
+                onChange={(e) => setMinFaceSize(parseInt(e.target.value))}
+              />
+              <div className="sett-slider-labels"><span>20px</span><span>200px</span></div>
+              <p className="sett-hint">Wajah lebih kecil dari {minFaceSize}×{minFaceSize} pixel akan di-skip (terlalu jauh)</p>
+            </div>
+          </div>
+
+          {/* Cooldown */}
+          <div className="sett-form-group" style={{ marginTop: 16 }}>
+            <label className="sett-label">Capture Cooldown: <strong>{captureCooldown.toFixed(1)}s</strong></label>
+            <input
+              type="range"
+              className="sett-slider"
+              min={1}
+              max={60}
+              step={0.5}
+              value={captureCooldown}
+              onChange={(e) => setCaptureCooldown(parseFloat(e.target.value))}
+            />
+            <div className="sett-slider-labels"><span>1s</span><span>60s</span></div>
+            <p className="sett-hint">Jarak minimum antar capture untuk orang yang sama. Capture hanya terjadi ulang jika cooldown habis atau ekspresi berubah.</p>
+          </div>
+
+          <div className="sett-actions" style={{ marginTop: 16 }}>
+            <button className="sett-btn sett-btn--primary" onClick={handleSaveCaptureConfig} disabled={captureSaving}>
+              {captureSaving ? <><RefreshCw size={14} className="sett-spin" /> Saving…</> : <><Check size={14} /> Save Capture Config</>}
+            </button>
+            <button className="sett-btn sett-btn--secondary" onClick={handleResetCaptureDefaults}>
+              <RefreshCw size={14} /> Reset Defaults
+            </button>
+            {captureSaveMsg && <span className={`sett-save-msg ${captureSaveMsg.includes('saved') ? 'sett-save-msg--ok' : 'sett-save-msg--err'}`}>{captureSaveMsg}</span>}
+          </div>
+        </div>
+
+        {/* Current Filter Summary */}
+        <div className="sett-card">
+          <div className="sett-card__header"><Info size={16} /> Current Active Config</div>
+          <div className="sett-env-grid">
+            <div className="sett-env-row">
+              <span>Tracking</span>
+              <span className={pipelineToggles.tracking_enabled ? 'sett-text-green' : 'sett-text-red'}>
+                {pipelineToggles.tracking_enabled ? '✓ Enabled' : '✗ Disabled'}
+              </span>
+            </div>
+            <div className="sett-env-row">
+              <span>Face Analysis</span>
+              <span className={pipelineToggles.insightface_enabled ? 'sett-text-green' : 'sett-text-red'}>
+                {pipelineToggles.insightface_enabled ? '✓ Enabled' : '✗ Disabled'}
+              </span>
+            </div>
+            <div className="sett-env-row"><span>Min Confidence</span><span>{captureConfidence.toFixed(2)}</span></div>
+            <div className="sett-env-row"><span>Min Face Size</span><span>{minFaceSize}×{minFaceSize} px</span></div>
+            <div className="sett-env-row"><span>Capture Cooldown</span><span>{captureCooldown.toFixed(1)} sec</span></div>
           </div>
         </div>
       </div>
@@ -401,6 +642,7 @@ export default function SettingsPage() {
 
   const tabRenderers: Record<TabId, () => JSX.Element> = {
     system: renderSystemInfo,
+    pipeline: renderPipelineConfig,
     models: renderModelConfig,
     stream: renderStreamSettings,
     storage: renderStorage,

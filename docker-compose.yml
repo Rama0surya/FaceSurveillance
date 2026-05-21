@@ -8,10 +8,10 @@ services:
     restart: unless-stopped
 
     environment:
-      MYSQL_ROOT_PASSWORD:  ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE:       ${MYSQL_DATABASE}
-      MYSQL_USER:           ${MYSQL_USER}
-      MYSQL_PASSWORD:       ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
 
     # command:
     #   - --default-authentication-plugin=mysql_native_password
@@ -26,7 +26,7 @@ services:
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost" ]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -73,16 +73,13 @@ services:
       - .env
     environment:
       ENV: development
-      API_HOST:                   0.0.0.0
-      API_PORT:                   8000
-      # --------------------------------------------------------
-      # MySQL
-      # --------------------------------------------------------
-      MYSQL_HOST:                 mysql
-      MYSQL_PORT:                 3306
-      MYSQL_USER:                 ${MYSQL_USER}
-      MYSQL_PASSWORD:             ${MYSQL_PASSWORD}
-      MYSQL_DATABASE:             ${MYSQL_DATABASE}
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      DB_HOST: mysql # ← sesuai Settings
+      DB_PORT: 3306
+      DB_USER: ${MYSQL_USER}
+      DB_PASSWORD: ${MYSQL_PASSWORD}
+      DB_NAME: ${MYSQL_DATABASE}
 
       # --------------------------------------------------------
       # AI Settings
@@ -105,37 +102,35 @@ services:
       # --------------------------------------------------------
       # MediaMTX
       # --------------------------------------------------------
-      MEDIAMTX_API_URL:           http://mediamtx:9997
-      MEDIAMTX_HOST:              mediamtx
-      MEDIAMTX_RTSP_PORT:         8554
+      MEDIAMTX_API_URL: http://mediamtx:9997
+      MEDIAMTX_HOST: mediamtx
+      MEDIAMTX_RTSP_PORT: 8554
       # --------------------------------------------------------
       # CORS
       # --------------------------------------------------------
-      CORS_ORIGINS: '["*"]'
+      CORS_ORIGINS: "*"
 
     volumes:
       - ./backend:/app
       - ./snapshots:/app/snapshots
+      - insightface_models:/home/appuser/.insightface
 
     command: >
-      sh -c "
-      python -m pip install --no-cache-dir pymysql sqlalchemy &&
-      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-      "
+      sh -c " python -m pip install --no-cache-dir pymysql sqlalchemy && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload "
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/docs" ]
       interval: 30s
       timeout: 10s
       retries: 5
 
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
     ports:
       - "8000:8000"
     networks:
@@ -184,10 +179,11 @@ services:
 # ------------------------------------------------------------
 volumes:
   mysql_data:
+  insightface_models:
 
-# ------------------------------------------------------------
-# Network
-# ------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Network
+    # ------------------------------------------------------------
 networks:
   face-net:
     driver: bridge

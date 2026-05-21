@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
+from app.services.pipeline_state import pipeline_state
 from app.services.system_info import SystemInfo, system_info_cache
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,45 @@ async def get_model_info():
 
 
 # =====================================================================
+# Pipeline Toggles (runtime ON/OFF)
+# =====================================================================
+
+class PipelineToggleUpdate(BaseModel):
+    """Body for PUT /api/settings/pipeline-toggles."""
+    tracking_enabled: Optional[bool] = Field(
+        None, description="Enable/disable ByteTrack tracking in Thread B"
+    )
+    insightface_enabled: Optional[bool] = Field(
+        None, description="Enable/disable InsightFace + DeepFace + snapshot in Thread C"
+    )
+
+
+@router.get("/pipeline-toggles")
+async def get_pipeline_toggles():
+    """Return current pipeline toggle state."""
+    return pipeline_state.get_state()
+
+
+@router.put("/pipeline-toggles")
+async def update_pipeline_toggles(body: PipelineToggleUpdate):
+    """Update pipeline toggles at runtime (instant, no restart needed).
+
+    - ``tracking_enabled=false`` → Thread B skips ByteTrack (YOLO-only, faster)
+    - ``insightface_enabled=false`` → Thread C idles (no age/gender/emotion/snapshot)
+    """
+    updates = {}
+    if body.tracking_enabled is not None:
+        updates["tracking_enabled"] = body.tracking_enabled
+    if body.insightface_enabled is not None:
+        updates["insightface_enabled"] = body.insightface_enabled
+
+    if not updates:
+        return pipeline_state.get_state()
+
+    return pipeline_state.update(**updates)
+
+
+# =====================================================================
 # Detection Config (runtime update)
 # =====================================================================
 class DetectionConfigUpdate(BaseModel):
@@ -78,6 +118,16 @@ class DetectionConfigUpdate(BaseModel):
     )
     track_reanalyze_ttl: Optional[int] = Field(
         None, ge=10, le=3600, description="Seconds before re-analyzing a tracked face"
+    )
+    # ── Smart capture settings ──
+    capture_min_confidence: Optional[float] = Field(
+        None, ge=0.1, le=1.0, description="Min YOLO confidence to capture (anti-false-positive)"
+    )
+    min_face_size: Optional[int] = Field(
+        None, ge=20, le=500, description="Min face bbox size in pixels (anti-background)"
+    )
+    capture_cooldown: Optional[float] = Field(
+        None, ge=1.0, le=60.0, description="Seconds between captures of same track_id"
     )
 
 
@@ -138,6 +188,19 @@ async def update_detection_config(body: DetectionConfigUpdate):
         settings.TRACK_REANALYZE_TTL = body.track_reanalyze_ttl
         logger.info("Updated TRACK_REANALYZE_TTL → %s", body.track_reanalyze_ttl)
 
+    # ── Smart capture settings ──
+    if body.capture_min_confidence is not None:
+        settings.CAPTURE_MIN_CONFIDENCE = body.capture_min_confidence
+        logger.info("Updated CAPTURE_MIN_CONFIDENCE → %s", body.capture_min_confidence)
+
+    if body.min_face_size is not None:
+        settings.MIN_FACE_SIZE = body.min_face_size
+        logger.info("Updated MIN_FACE_SIZE → %s", body.min_face_size)
+
+    if body.capture_cooldown is not None:
+        settings.CAPTURE_COOLDOWN = body.capture_cooldown
+        logger.info("Updated CAPTURE_COOLDOWN → %s", body.capture_cooldown)
+
     return {
         "detection_interval": settings.DETECTION_INTERVAL_SECONDS,
         "frame_fps": settings.FRAME_BROADCAST_FPS,
@@ -146,6 +209,9 @@ async def update_detection_config(body: DetectionConfigUpdate):
         "yolo_confidence": settings.YOLO_CONFIDENCE,
         "face_tracker": settings.FACE_TRACKER,
         "track_reanalyze_ttl": settings.TRACK_REANALYZE_TTL,
+        "capture_min_confidence": settings.CAPTURE_MIN_CONFIDENCE,
+        "min_face_size": settings.MIN_FACE_SIZE,
+        "capture_cooldown": settings.CAPTURE_COOLDOWN,
     }
 
 
