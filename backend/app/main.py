@@ -101,7 +101,8 @@ from app.routes.websocket import router as ws_router           # noqa: E402
 from app.routes.debug import router as debug_router            # noqa: E402
 from app.routes.alerts import router as alerts_router          # noqa: E402
 from app.routes.settings import router as settings_router      # noqa: E402
-
+from app.routes.hls_proxy import router as hls_router
+app.include_router(hls_router)
 app.include_router(cameras_router)
 app.include_router(detections_router)
 app.include_router(stats_router)

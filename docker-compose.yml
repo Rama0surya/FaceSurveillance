@@ -1,40 +1,46 @@
+name: face-surveillance
+
+networks:
+  web-network:
+    external: true
+
+volumes:
+  insightface_models:
+
 services:
-  # ----------------------------------------------------------------
-  # MediaMTX — RTSP proxy server (optional but recommended)
-  # ----------------------------------------------------------------
   mediamtx:
     image: bluenviron/mediamtx:latest
     container_name: face_surveillance_mediamtx
-    ports:
-      - "8554:8554"   # RTSP
-      - "1935:1935"   # RTMP
-      - "8888:8888"   # HLS
-      - "9997:9997"   # API
+    expose:
+      - "8554"   # RTSP — hanya untuk backend
+      - "8888"   # HLS  — hanya untuk backend (proxy)
+      - "9997"   # API  — hanya untuk backend
     volumes:
-      - ./mediamtx/mediamtx.yml:/mediamtx.yml
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
     restart: unless-stopped
+    networks:
+      - web-network
 
-  # ----------------------------------------------------------------
-  # Backend — FastAPI + AI detection engine
-  # ----------------------------------------------------------------
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: face_surveillance_backend
-    ports:
-      - "8000:8000"
+    expose:
+      - "8000"
     env_file:
       - .env
     environment:
-      - ENV=development
+      - ENV=production
       - MEDIAMTX_API_URL=http://mediamtx:9997
       - MEDIAMTX_RTSP_URL=rtsp://mediamtx:8554
+      - MEDIAMTX_HLS_URL=http://mediamtx:8888   # ← untuk HLS proxy
       - USE_MEDIAMTX=true
     volumes:
-      - ./backend:/app
       - ./snapshots:/app/snapshots
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      - ./backend/models/yolov8n-face-lindevs.pt:/app/yolov8n-face-lindevs.pt
+      - insightface_models:/home/appuser/.insightface
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     depends_on:
       - mediamtx
     restart: unless-stopped
@@ -43,32 +49,23 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-    # GPU support — Docker will ignore this if no NVIDIA runtime is available
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    networks:
+      - web-network
 
-  # ----------------------------------------------------------------
-  # Frontend — React + Vite dashboard
-  # ----------------------------------------------------------------
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_API_URL: https://api.facesurveillance.verloxes.my.id
+        VITE_WS_URL: wss://api.facesurveillance.verloxes.my.id
+        # Tidak perlu VITE_MEDIAMTX_URL — HLS diproxy lewat backend
     container_name: face_surveillance_frontend
-    ports:
-      - "5173:5173"
-    env_file:
-      - ./frontend/.env
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-    command: npm run dev -- --host
+    expose:
+      - "5173"
     depends_on:
       backend:
         condition: service_started
     restart: unless-stopped
+    networks:
+      - web-network

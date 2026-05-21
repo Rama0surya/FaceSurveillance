@@ -1,51 +1,60 @@
 # ==========================================================================
-# Backend Dockerfile — Face Surveillance
+# Backend Dockerfile — Face Surveillance (Raspberry Pi / aarch64)
 # ==========================================================================
-# Supports optional GPU acceleration via build argument.
-#
-# CPU build (default):
-#   docker build -t face-backend .
-#
-# GPU build (requires NVIDIA Container Toolkit on host):
-#   docker build --build-arg USE_GPU=true -t face-backend-gpu .
-# ==========================================================================
-
 FROM python:3.11-slim
 
 ARG USE_GPU=false
 
 WORKDIR /app
 
-# System dependencies for OpenCV, DeepFace, ffmpeg, and health checks
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx \
+# System deps — curl for healthcheck, build tools for C extensions
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    python3-dev \
+    libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender1 \
-    ffmpeg \
+    libxrender-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python dependencies
+# Install torch CPU-only FIRST — prevents ultralytics/deepface
+# from pulling in 1.8 GB of CUDA libs on a Pi with no GPU
+RUN pip install --no-cache-dir \
+    torch torchvision \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Copy and install remaining requirements
 COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install all requirements EXCEPT onnxruntime variants (handled below)
-RUN pip install --no-cache-dir $(grep -vE "onnxruntime" requirements.txt)
-
-# Conditional onnxruntime install: GPU or CPU
+# Conditional onnxruntime: pinned exact versions
 RUN if [ "$USE_GPU" = "true" ]; then \
-        echo "Installing onnxruntime-gpu for CUDA support..." && \
-        pip install --no-cache-dir onnxruntime-gpu>=1.17.0; \
+        pip install --no-cache-dir onnxruntime-gpu==1.18.0; \
     else \
-        echo "Installing onnxruntime (CPU only)..." && \
-        pip install --no-cache-dir onnxruntime>=1.17.0; \
+        pip install --no-cache-dir onnxruntime==1.18.0; \
     fi
 
-# Copy application code
-COPY . .
+# Non-root user for security
+RUN useradd -m -u 1000 appuser
 
-# Health check
+# Pre-create InsightFace model directory with correct ownership
+# so the volume mount is writable by appuser at runtime
+RUN mkdir -p /home/appuser/.insightface/models && \
+    chown -R appuser:appuser /home/appuser/.insightface
+
+# Set Ultralytics config dir to a writable location
+ENV YOLO_CONFIG_DIR=/tmp/yolo
+
+# Copy application code
+COPY --chown=appuser:appuser . .
+
+USER appuser
+
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
     CMD curl -f http://localhost:8000/ || exit 1
 
