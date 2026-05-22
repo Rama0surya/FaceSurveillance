@@ -1,29 +1,36 @@
 """
 Detection engine — runs face detection on RTSP/HLS streams.
 
-Architecture: 3-Thread Producer-Consumer Pipeline
+Architecture: 4-Thread Producer-Consumer Pipeline
 =================================================
 
-Each camera gets its own ``StreamWorker`` with **three decoupled threads**:
+Each camera gets its own ``StreamWorker`` with **four decoupled threads**:
 
   Thread A — **RTSP Frame Grabber**
     Reads frames from the RTSP stream as fast as possible (30 FPS+).
-    Puts frames into a bounded ``frame_queue`` (maxsize=2).
-    If the queue is full, the oldest frame is **dropped** (frame-skipping)
-    so that Thread B always gets the freshest frame available.
+    Puts frames into two bounded queues: ``frame_queue`` (for AI) and
+    ``broadcast_queue`` (for frontend).  If either queue is full, the
+    oldest frame is **dropped** (frame-skipping) so that downstream
+    consumers always get the freshest frame available.
 
-  Thread B — **YOLO + ByteTrack Detector**
+  Thread B — **YOLO + ByteTrack Detector** (AI-only, no broadcast)
     Pulls frames from ``frame_queue``, runs YOLOv8n-face detection and
     (optionally) ByteTrack tracking.  Applies smart capture filters:
     confidence threshold, minimum face size, and per-track cooldown
-    with emotion-change bypass.  Broadcasts frames to WebSocket clients.
-    When capture criteria are met, enqueues ``AnalysisTask`` for Thread C.
+    with emotion-change bypass.  When capture criteria are met,
+    enqueues ``AnalysisTask`` for Thread C.
 
   Thread C — **Heavy Inference Worker**
     Pulls ``AnalysisTask`` items from ``analysis_queue``.
     Runs InsightFace (age/gender) + DeepFace (emotion), saves snapshots,
     persists to DB, evaluates alerts, and broadcasts results via WebSocket.
     Can be toggled OFF entirely via pipeline_state for maximum FPS.
+
+  Thread D — **Frame Broadcast Worker** (DECOUPLED from AI)
+    Pulls frames from ``broadcast_queue`` and pushes JPEG-encoded frames
+    to all MJPEG client queues.  Runs at the configured ``frame_fps``
+    rate, completely independent of YOLO/InsightFace inference timing.
+    Frontend streams are NEVER blocked by AI inference latency.
 
 Runtime Toggles (via ``pipeline_state``):
   - ``tracking_enabled``:    ON/OFF ByteTrack in Thread B
@@ -37,12 +44,24 @@ Smart Capture Filters:
 Pipeline modes:
   - **Modern** (default): YOLOv8n-face → ByteTrack → InsightFace → DeepFace emotion
   - **Legacy** (fallback): DeepFace.analyze() for everything
+
+Refactoring changelog:
+  - **Thread D decoupling**: Frame broadcast moved out of Thread B into
+    dedicated Thread D — eliminates AI-induced stream lag
+  - Lock-free toggle reads via pipeline_state.snapshot()
+  - Runtime config reads from runtime_config (not Pydantic settings)
+  - Fixed safe_put_frame threading issue for MJPEG queues
+  - Eliminated double-cooldown bug between Thread B and Thread C
+  - Reduced memory allocations: shared full_frame copy across tasks
+  - Smarter track state cleanup (time-based, lower threshold)
+  - Removed dead AnalysisTask.Config (Pydantic concept in dataclass)
+  - Safe track_id sentinel (-1) when tracking is disabled
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
+# base64 import removed — WS frame broadcast eliminated (MJPEG only)
 import io
 import logging
 import queue
@@ -61,11 +80,12 @@ from PIL import Image
 from app.core.config import settings
 from app.core.db_client import upload_snapshot
 from app.core.websocket import manager as ws_manager
+from app.core.sse import sse_manager
 from app.db.detections import insert_detection, insert_snapshot
 from app.db.stats import upsert_hourly_stats
 from app.db.cameras import update_camera_status, get_camera_raw
 from app.services.alert_engine import alert_engine
-from app.services.pipeline_state import pipeline_state
+from app.services.pipeline_state import pipeline_state, runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -147,15 +167,34 @@ class AnalysisTask:
     """
     camera_id: str
     frame_crop: np.ndarray       # Padded face crop for InsightFace (independent copy)
-    full_frame: np.ndarray       # Full frame copy for snapshot saving
+    full_frame: np.ndarray       # Full frame copy for snapshot saving (shared across tasks)
     bbox: dict                   # {"x", "y", "w", "h"} — plain dict, safe
-    track_id: int
+    track_id: int                # -1 sentinel when tracking is disabled
     confidence: float
     timestamp: str
 
-    class Config:
-        # Allow numpy arrays in frozen dataclass
-        arbitrary_types_allowed = True
+
+# =====================================================================
+# MJPEG safe-put helper (fixed for asyncio.Queue from non-loop thread)
+# =====================================================================
+
+def _safe_put_frame_sync(q: asyncio.Queue, frame_bytes: bytes) -> None:
+    """Non-blocking put into an asyncio.Queue — must be called from the event loop thread.
+
+    This function is invoked via ``loop.call_soon_threadsafe()``, so it
+    executes on the event loop thread where asyncio.Queue operations are safe.
+
+    Drop-oldest-on-full strategy prevents unbounded memory growth.
+    """
+    if q.full():
+        try:
+            q.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        q.put_nowait(frame_bytes)
+    except asyncio.QueueFull:
+        pass  # extremely unlikely after drop — just skip
 
 
 # =====================================================================
@@ -172,6 +211,9 @@ class StreamWorker:
 
     Runtime toggles from ``pipeline_state`` are checked on every iteration,
     allowing instant ON/OFF of tracking and InsightFace without restart.
+
+    Runtime config from ``runtime_config`` is read on every iteration,
+    allowing instant parameter changes without restart.
     """
 
     def __init__(self, camera_id: str, rtsp_url: str, loop: asyncio.AbstractEventLoop) -> None:
@@ -187,6 +229,11 @@ class StreamWorker:
         self._analysis_queue: queue.Queue[Optional[AnalysisTask]] = queue.Queue(
             maxsize=max(1, settings.ANALYSIS_QUEUE_SIZE),
         )
+        # Broadcast queue (Thread A → Thread D) — decoupled from AI pipeline.
+        # Frontend always gets fresh frames regardless of YOLO/InsightFace latency.
+        self._broadcast_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(
+            maxsize=2,  # Small = always the freshest frame
+        )
 
         # ---- Thread references ----
         self._threads: list[threading.Thread] = []
@@ -199,6 +246,11 @@ class StreamWorker:
         # track_id → TrackState  (shared between Thread B reads & Thread C writes)
         self._track_state: dict[int, TrackState] = {}
         self._track_state_lock = threading.Lock()
+        self._last_track_cleanup: float = 0.0  # time-based cleanup instead of count-based
+
+        # ---- MJPEG streaming queues ----
+        self._mjpeg_queues: list[tuple[asyncio.Queue[bytes], asyncio.AbstractEventLoop]] = []
+        self._mjpeg_queues_lock = threading.Lock()
 
         # --- Tracker model (modern pipeline) ---
         self._tracker_model = None
@@ -242,9 +294,10 @@ class StreamWorker:
         self._drain_queue(self._analysis_queue)
 
         thread_specs = [
-            ("grabber",  self._frame_grabber_loop),
-            ("detector", self._detection_loop),
-            ("analyzer", self._analysis_worker_loop),
+            ("grabber",     self._frame_grabber_loop),
+            ("detector",    self._detection_loop),
+            ("analyzer",    self._analysis_worker_loop),
+            ("broadcaster", self._broadcast_worker_loop),
         ]
 
         for name, target in thread_specs:
@@ -257,7 +310,7 @@ class StreamWorker:
             t.start()
 
         logger.info(
-            "StreamWorker started for camera %s — 3 threads active",
+            "StreamWorker started for camera %s — 4 threads active",
             self.camera_id,
         )
 
@@ -266,14 +319,11 @@ class StreamWorker:
         self._stop_event.set()
 
         # Inject sentinel values to unblock any thread waiting on queue.get()
-        try:
-            self._frame_queue.put_nowait(None)
-        except queue.Full:
-            pass
-        try:
-            self._analysis_queue.put_nowait(None)
-        except queue.Full:
-            pass
+        for q in (self._frame_queue, self._analysis_queue, self._broadcast_queue):
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
 
         for t in self._threads:
             if t.is_alive():
@@ -335,17 +385,48 @@ class StreamWorker:
             else:
                 state.last_capture_time = time.time()
 
-    def _cleanup_stale_tracks(self, max_age: float = 60.0) -> None:
-        """Remove track states older than max_age seconds."""
+    def _cleanup_stale_tracks(self, cooldown: float) -> None:
+        """Remove track states older than TTL, on a time-based interval.
+
+        Runs at most once every 30 seconds to avoid overhead.
+        Uses ``max(cooldown * 3, 30.0)`` as TTL — aggressive enough to
+        prevent memory growth in crowded scenes.
+        """
+        now = time.time()
+        if now - self._last_track_cleanup < 30.0:
+            return  # too soon, skip
+
+        self._last_track_cleanup = now
+        max_age = max(cooldown * 3, 30.0)
+        cutoff = now - max_age
+
         with self._track_state_lock:
-            if len(self._track_state) <= 200:
+            before = len(self._track_state)
+            if before <= 20:
                 return  # not worth cleaning yet
-            now = time.time()
-            cutoff = now - max_age
+
             self._track_state = {
                 tid: s for tid, s in self._track_state.items()
                 if s.last_capture_time > cutoff
             }
+            after = len(self._track_state)
+            if before != after:
+                logger.debug(
+                    "[Camera %s] Track state cleanup: %d → %d entries",
+                    self.camera_id[:8], before, after,
+                )
+
+    def register_mjpeg_queue(self, q: asyncio.Queue[bytes], loop: asyncio.AbstractEventLoop) -> None:
+        """Register an asyncio queue for MJPEG streaming."""
+        with self._mjpeg_queues_lock:
+            self._mjpeg_queues.append((q, loop))
+            logger.info("MJPEG queue registered for camera %s, total=%d", self.camera_id, len(self._mjpeg_queues))
+
+    def unregister_mjpeg_queue(self, q: asyncio.Queue[bytes]) -> None:
+        """Unregister an asyncio queue from MJPEG streaming."""
+        with self._mjpeg_queues_lock:
+            self._mjpeg_queues = [item for item in self._mjpeg_queues if item[0] is not q]
+            logger.info("MJPEG queue unregistered for camera %s, total=%d", self.camera_id, len(self._mjpeg_queues))
 
     # =================================================================
     # THREAD A — RTSP Frame Grabber
@@ -366,6 +447,13 @@ class StreamWorker:
         Reconnect strategy:
           On stream failure, retries with exponential backoff
           (2s → 4s → 8s → … → 30s max).
+
+        Memory optimisation:
+          cv2.VideoCapture.read() returns a new buffer per call on most
+          backends.  We attempt put_nowait first; only if the queue has
+          space do we commit the frame.  If full, we drop-oldest then put.
+          No unnecessary .copy() — the frame from read() is already our
+          exclusive reference.
         """
         logger.info(
             "[Thread-A] Frame grabber started for camera %s (%s)",
@@ -405,13 +493,17 @@ class StreamWorker:
                     # --------------------------------------------------
                     # Enqueue frame with frame-skipping semantics:
                     # If queue is full, drop the oldest frame, put the new one.
-                    # frame.copy() transfers ownership — no shared mutation.
+                    # cv2 read() typically gives us a unique buffer, but some
+                    # backends reuse buffers — .copy() ensures safety.
                     # --------------------------------------------------
+                    # Single copy shared between AI queue and broadcast queue.
+                    # Both Thread B and Thread D only read the frame.
                     frame_copy = frame.copy()
+
+                    # ---- Enqueue for AI (Thread B) ----
                     try:
                         self._frame_queue.put_nowait(frame_copy)
                     except queue.Full:
-                        # Queue full → drop oldest, insert newest
                         try:
                             self._frame_queue.get_nowait()
                         except queue.Empty:
@@ -419,7 +511,20 @@ class StreamWorker:
                         try:
                             self._frame_queue.put_nowait(frame_copy)
                         except queue.Full:
-                            pass  # extremely unlikely, just skip this frame
+                            pass
+
+                    # ---- Enqueue for Broadcast (Thread D) ----
+                    try:
+                        self._broadcast_queue.put_nowait(frame_copy)
+                    except queue.Full:
+                        try:
+                            self._broadcast_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            self._broadcast_queue.put_nowait(frame_copy)
+                        except queue.Full:
+                            pass
 
             except Exception:
                 logger.exception(
@@ -441,28 +546,22 @@ class StreamWorker:
     # =================================================================
 
     def _detection_loop(self) -> None:
-        """Thread B: Fast detection + tracking + frame broadcast.
+        """Thread B: Fast detection + tracking (AI ONLY — no broadcast).
 
         Pulls frames from ``frame_queue``, runs YOLOv8n-face + (optionally)
-        ByteTrack, applies smart capture filters, broadcasts annotated
-        frames via WebSocket, and enqueues ``AnalysisTask`` for new faces.
+        ByteTrack, applies smart capture filters, and enqueues
+        ``AnalysisTask`` for new faces.
 
-        Detection is throttled by ``DETECTION_INTERVAL_SECONDS`` to prevent
-        over-detection (30+ YOLO calls/sec).  Frame broadcast is NOT
-        throttled by this — it runs on every eligible tick so the live
-        video stream stays smooth.
+        Frame broadcast has been moved to Thread D (broadcast worker)
+        so that AI inference latency NEVER delays the frontend stream.
 
-        Toggle-aware:
-          - ``pipeline_state.tracking_enabled == False`` → skip ByteTrack
-          - ``pipeline_state.insightface_enabled == False`` → skip enqueue
+        Toggle-aware (lock-free via pipeline_state.snapshot()):
+          - ``tracking_enabled == False`` → skip ByteTrack
+          - ``insightface_enabled == False`` → skip enqueue
         """
         from app.services.model_manager import model_manager
 
         logger.info("[Thread-B] Detector started for camera %s", self.camera_id)
-
-        # Frame broadcast throttle
-        frame_interval = 1.0 / max(settings.FRAME_BROADCAST_FPS, 1)
-        last_frame_broadcast = 0.0
 
         # Detection throttle — prevent running YOLO on every single frame
         last_detection = 0.0
@@ -480,15 +579,15 @@ class StreamWorker:
 
             now = time.time()
 
-            # ---- Frame broadcast (throttled by FPS, NOT by detection interval) ----
-            if now - last_frame_broadcast >= frame_interval:
-                last_frame_broadcast = now
-                self._broadcast_frame(frame)
+            # ---- Read runtime config (lock-free, GIL-atomic) ----
+            detection_interval = runtime_config.detection_interval
+
+            # NOTE: Frame broadcast has been moved to Thread D.
+            # Thread B is now 100% dedicated to AI inference.
 
             # ---- Detection interval gate ----
-            # Only run AI detection every DETECTION_INTERVAL_SECONDS.
-            # This prevents over-detection while keeping stream smooth.
-            if now - last_detection < settings.DETECTION_INTERVAL_SECONDS:
+            # Only run AI detection every detection_interval seconds.
+            if now - last_detection < detection_interval:
                 continue
             last_detection = now
 
@@ -500,34 +599,85 @@ class StreamWorker:
 
         logger.info("[Thread-B] Detector stopped for camera %s", self.camera_id)
 
+    # =================================================================
+    # THREAD D — Frame Broadcast Worker (DECOUPLED from AI)
+    # =================================================================
+
+    def _broadcast_worker_loop(self) -> None:
+        """Thread D: Dedicated frame broadcaster — NEVER blocked by AI.
+
+        Pulls frames from ``broadcast_queue`` (fed by Thread A) and pushes
+        JPEG-encoded frames to all MJPEG client queues.
+
+        This thread runs at the configured ``frame_fps`` rate, completely
+        independent of YOLO/InsightFace inference timing.
+
+        Why a separate thread?
+          Thread B previously handled both AI detection AND frame broadcast.
+          When YOLO takes 100ms+, the broadcast was delayed, causing visible
+          lag on the frontend.  Thread D eliminates this coupling entirely.
+        """
+        logger.info(
+            "[Thread-D] Broadcast worker started for camera %s", self.camera_id
+        )
+
+        last_broadcast = 0.0
+
+        while not self._stop_event.is_set():
+            # ---- Pull frame from broadcast queue ----
+            try:
+                frame = self._broadcast_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            # Sentinel check (shutdown signal)
+            if frame is None:
+                break
+
+            now = time.time()
+
+            # ---- Throttle by configured FPS ----
+            frame_interval = 1.0 / max(runtime_config.frame_fps, 1)
+            if now - last_broadcast < frame_interval:
+                continue  # Too soon — skip this frame (drop-oldest semantics)
+            last_broadcast = now
+
+            # ---- Broadcast to MJPEG clients ----
+            self._broadcast_frame(frame)
+
+        logger.info(
+            "[Thread-D] Broadcast worker stopped for camera %s", self.camera_id
+        )
+
     def _process_frame_modern(self, frame: np.ndarray) -> None:
         """Modern pipeline (Thread B): detect → filter → smart capture → enqueue.
 
         Smart capture filter chain:
-          1. YOLO confidence ≥ CAPTURE_MIN_CONFIDENCE
-          2. Face bbox ≥ MIN_FACE_SIZE × MIN_FACE_SIZE pixels
+          1. YOLO confidence ≥ capture_min_confidence
+          2. Face bbox ≥ min_face_size × min_face_size pixels
           3. Detection zone check
-          4. Per-track cooldown (CAPTURE_COOLDOWN) with emotion-change bypass
+          4. Per-track cooldown (capture_cooldown) with emotion-change bypass
 
-        Toggle-aware:
+        Toggle-aware (using snapshot for TOCTOU consistency):
           - tracking_enabled OFF → YOLO detection only (no ByteTrack)
           - insightface_enabled OFF → skip enqueue entirely (no Thread C work)
         """
         from app.services.model_manager import model_manager
 
-        # ---- Read runtime toggles (instant, no restart needed) ----
-        tracking_on = pipeline_state.tracking_enabled
-        analysis_on = pipeline_state.insightface_enabled
+        # ---- Read runtime toggles (lock-free snapshot) ----
+        toggles = pipeline_state.snapshot()
+        tracking_on = toggles.tracking_enabled
+        analysis_on = toggles.insightface_enabled
 
-        # ---- Read smart capture thresholds ----
-        min_confidence = settings.CAPTURE_MIN_CONFIDENCE
-        min_face_size = settings.MIN_FACE_SIZE
-        capture_cooldown = settings.CAPTURE_COOLDOWN
+        # ---- Read smart capture thresholds (GIL-atomic reads) ----
+        min_confidence = runtime_config.capture_min_confidence
+        min_face_size = runtime_config.min_face_size
+        capture_cooldown = runtime_config.capture_cooldown
 
         # ---- Step 1: Detect (+Track if enabled) ----
-        tracker_cfg = getattr(settings, "FACE_TRACKER", "bytetrack")
+        tracker_cfg = runtime_config.face_tracker
         tracker_yaml = f"{tracker_cfg}.yaml" if tracker_cfg != "none" else None
-        yolo_conf = getattr(settings, "YOLO_CONFIDENCE", 0.5)
+        yolo_conf = runtime_config.yolo_confidence
 
         try:
             if tracking_on and tracker_yaml:
@@ -542,9 +692,10 @@ class StreamWorker:
             else:
                 # Tracking disabled OR no tracker config — detection only
                 tracked_faces = model_manager.detect_faces_yolo(frame, conf=yolo_conf)
-                # Assign sequential IDs (no persistent tracking)
-                for i, f in enumerate(tracked_faces):
-                    f["track_id"] = i
+                # Assign sentinel track_id = -1 (not a real ByteTrack ID)
+                # This prevents collisions with real IDs when tracking is re-enabled.
+                for f in tracked_faces:
+                    f["track_id"] = -1
         except Exception:
             logger.exception("[Thread-B] YOLO detect/track failed for camera %s", self.camera_id)
             return
@@ -584,49 +735,57 @@ class StreamWorker:
             return
 
         # ---- Step 6: Smart cooldown + emotion-change bypass ----
+        # Thread B is the SOLE gatekeeper for cooldown. Thread C only
+        # analyzes and updates emotion state — it does NOT re-check cooldown.
         now = time.time()
         faces_to_capture: list[dict] = []
 
         for face in tracked_faces:
-            track_id = face.get("track_id")
+            track_id = face.get("track_id", -1)
 
-            if track_id is not None and tracking_on:
+            # Only apply per-track cooldown if tracking is active (track_id >= 0)
+            if track_id >= 0 and tracking_on:
                 state = self._get_track_state(track_id)
 
                 if state is not None:
                     time_since_last = now - state.last_capture_time
 
                     if time_since_last < capture_cooldown:
-                        # Within cooldown window — only capture if we could
-                        # detect an emotion change. But Thread B doesn't know
-                        # the NEW emotion yet (that's Thread C's job).
+                        # Within cooldown — skip unless we detect emotion change.
+                        # But Thread B doesn't know the NEW emotion yet (Thread C
+                        # handles that). So we simply enforce the time cooldown here.
                         #
-                        # Strategy: We let Thread C handle emotion comparison.
-                        # Thread B simply enforces the time cooldown.
-                        # When Thread C detects a NEW emotion that differs from
-                        # last_emotion, it updates TrackState immediately,
-                        # effectively resetting the cooldown window for the
-                        # NEXT capture.
+                        # The emotion-change bypass works as follows:
+                        # When Thread C detects a DIFFERENT emotion, it calls
+                        # _set_track_capture() with the new emotion but does NOT
+                        # reset last_capture_time. This means the next time
+                        # Thread B checks, the cooldown will have naturally expired
+                        # (or the emotion data is already recorded for future comparison).
                         #
-                        # This means: within cooldown, same person is NOT
-                        # re-captured. After cooldown expires, person IS
-                        # re-captured, and if emotion changed, the cycle
-                        # continues at normal rate.
+                        # For a true emotion-change bypass (capture immediately when
+                        # expression changes), Thread C resets last_capture_time to 0
+                        # when emotion differs, so the NEXT Thread B cycle will pass
+                        # the cooldown check immediately.
                         continue
 
-                # Either new track or cooldown expired → capture
+                # Either new track or cooldown expired → mark pending and capture
                 self._mark_track_pending(track_id)
 
             faces_to_capture.append(face)
 
-        # Periodic cleanup of stale track states
-        self._cleanup_stale_tracks(max_age=max(capture_cooldown * 12, 60.0))
+        # Periodic cleanup of stale track states (time-based, every 30s)
+        self._cleanup_stale_tracks(cooldown=capture_cooldown)
 
         if not faces_to_capture:
             return
 
         # ---- Step 7: Enqueue faces for Thread C (heavy inference) ----
         timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Share a single full_frame copy across all AnalysisTask objects from
+        # this frame — Thread C only reads it (for snapshot saving), so sharing
+        # is safe.  Saves ~6MB per extra face on 1080p frames.
+        shared_full_frame = frame.copy()
 
         for face_data in faces_to_capture:
             bbox = face_data["bbox"]
@@ -646,7 +805,7 @@ class StreamWorker:
             task = AnalysisTask(
                 camera_id=self.camera_id,
                 frame_crop=crop,
-                full_frame=frame.copy(),  # Independent copy for snapshot
+                full_frame=shared_full_frame,  # Shared reference (read-only in Thread C)
                 bbox=bbox,
                 track_id=face_data.get("track_id", -1),
                 confidence=face_data.get("confidence", 0.0),
@@ -677,10 +836,12 @@ class StreamWorker:
           drains the queue but does NOT run any inference or I/O —
           effectively idling and freeing GPU resources.
 
-        Emotion-change tracking:
-          After analysis, updates ``_track_state[track_id].last_emotion``
-          so that Thread B's cooldown logic can detect emotion changes
-          on the next capture cycle.
+        Emotion-change tracking (the bypass mechanism):
+          After analysis, compares new_emotion vs last_emotion in TrackState.
+          If emotion CHANGED → resets last_capture_time to 0, so Thread B's
+          cooldown check will immediately allow the next capture cycle.
+          If emotion is SAME → normal: just update emotion, keep the
+          current last_capture_time (cooldown continues normally).
         """
         from app.services.model_manager import model_manager
 
@@ -736,21 +897,27 @@ class StreamWorker:
 
             new_emotion = emo["emotion"]
 
-            # ---- Emotion-change check (smart capture bypass) ----
-            # If the emotion is the SAME as last time AND we're within
-            # an extended cooldown, skip this capture entirely.
-            # This prevents redundant snapshots of the same expression.
+            # ---- Emotion-change tracking (smart capture bypass) ----
+            # Thread C does NOT re-check cooldown (Thread B already did).
+            # Thread C's job:
+            #   1. Analyse the face (done above).
+            #   2. Compare new emotion vs. last recorded emotion.
+            #   3. If emotion changed → reset cooldown (last_capture_time=0)
+            #      so Thread B allows immediate re-capture next cycle.
+            #   4. If emotion same → normal update (keep existing cooldown).
             if task.track_id >= 0:
                 prev_state = self._get_track_state(task.track_id)
-                if prev_state and prev_state.last_emotion:
-                    time_since = time.time() - prev_state.last_capture_time
-                    if (new_emotion == prev_state.last_emotion
-                            and time_since < settings.CAPTURE_COOLDOWN):
-                        # Same emotion within cooldown — skip capture
-                        continue
-
-                # Update track state with new emotion (thread-safe)
-                self._set_track_capture(task.track_id, new_emotion)
+                if prev_state and prev_state.last_emotion and prev_state.last_emotion != new_emotion:
+                    # Emotion CHANGED — bypass: reset cooldown so Thread B
+                    # allows the next capture immediately.
+                    with self._track_state_lock:
+                        state = self._track_state.get(task.track_id)
+                        if state:
+                            state.last_capture_time = 0.0
+                            state.last_emotion = new_emotion
+                else:
+                    # Same emotion or first capture — normal update
+                    self._set_track_capture(task.track_id, new_emotion)
 
             age_group = classify_age(ag["age"])
 
@@ -883,8 +1050,8 @@ class StreamWorker:
             return
 
         # ---- Read smart capture thresholds ----
-        min_face_size = settings.MIN_FACE_SIZE
-        min_confidence = settings.CAPTURE_MIN_CONFIDENCE
+        min_face_size = runtime_config.min_face_size
+        min_confidence = runtime_config.capture_min_confidence
 
         timestamp = datetime.now(timezone.utc).isoformat()
         faces_payload: list[dict] = []
@@ -964,24 +1131,34 @@ class StreamWorker:
 
         self._persist_and_broadcast(faces_payload, timestamp, stats_male, stats_female, dominant_emotion)
 
-    # ---- frame broadcast ---------------------------------------------
+    # ---- frame broadcast (MJPEG only) ----------------------------------
 
     def _broadcast_frame(self, frame: np.ndarray) -> None:
-        """Encode a frame to base64 JPEG and broadcast via WebSocket."""
-        # Only encode and broadcast if there are WS subscribers
-        if not ws_manager.stream_connections.get(self.camera_id):
-            return
+        """Encode a frame to JPEG and push to MJPEG client queues.
+
+        The WS base64 frame path has been removed — it was encoding every
+        frame as base64 (33% CPU overhead) but no frontend component
+        consumed it.  Detection events (bounding boxes, stats) still go
+        via ``ws_manager.broadcast_stream()`` in ``_persist_and_broadcast``.
+
+        If no MJPEG clients are connected, JPEG encoding is skipped
+        entirely (zero CPU cost when nobody is watching).
+        """
+        with self._mjpeg_queues_lock:
+            if not self._mjpeg_queues:
+                return  # No viewers — skip encoding entirely
 
         try:
             ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
             if not ret:
                 return
-            frame_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            jpg_bytes = buf.tobytes()
 
-            asyncio.run_coroutine_threadsafe(
-                ws_manager.broadcast_frame(self.camera_id, frame_b64),
-                self._loop,
-            )
+            # Push raw JPEG bytes to each MJPEG client queue.
+            # _safe_put_frame_sync runs on the event loop via call_soon_threadsafe.
+            with self._mjpeg_queues_lock:
+                for q, loop in self._mjpeg_queues:
+                    loop.call_soon_threadsafe(_safe_put_frame_sync, q, jpg_bytes)
         except Exception:
             logger.exception("Frame broadcast failed for camera %s", self.camera_id)
 
@@ -1082,6 +1259,49 @@ class StreamWorker:
         except Exception:
             logger.exception("WS broadcast failed for camera %s", self.camera_id)
 
+        # Schedule SSE broadcasts on the asyncio event loop
+        try:
+            # Broadcast the main detection event
+            asyncio.run_coroutine_threadsafe(
+                sse_manager.broadcast(
+                    self.camera_id,
+                    "detection",
+                    {
+                        "camera_id": self.camera_id,
+                        "faces": faces_payload,
+                        "stats_delta": {
+                            "total": len(faces_payload),
+                            "male": stats_male,
+                            "female": stats_female,
+                            "emotion": dominant_emotion,
+                        },
+                    },
+                    timestamp,
+                ),
+                self._loop,
+            )
+
+            # Broadcast separate snapshot events for each face that has a snapshot URL
+            for face in faces_payload:
+                if face.get("snapshot_url"):
+                    snap_data = {
+                        "id": face["id"],
+                        "camera_id": self.camera_id,
+                        "detection_id": detection_id,
+                        "url": face["snapshot_url"],
+                        "gender": face["gender"],
+                        "emotion": face["emotion"],
+                        "age": face["age"],
+                        "age_group": face["age_group"],
+                        "timestamp": timestamp,
+                    }
+                    asyncio.run_coroutine_threadsafe(
+                        sse_manager.broadcast(self.camera_id, "snapshot", snap_data, timestamp),
+                        self._loop,
+                    )
+        except Exception:
+            logger.exception("SSE broadcasts failed for camera %s", self.camera_id)
+
 
 # =====================================================================
 # Detection engine singleton
@@ -1094,12 +1314,21 @@ class DetectionEngine:
         self._workers: dict[str, StreamWorker] = {}
 
     def start_stream(self, camera_id: str, rtsp_url: str) -> None:
-        """Start detection on a camera stream."""
+        """Start detection on a camera stream.
+
+        Uses asyncio.get_running_loop() for correct event loop capture.
+        Falls back to get_event_loop() for non-async contexts (tests).
+        """
         if camera_id in self._workers and self._workers[camera_id].is_alive:
             logger.warning("Stream already running for camera %s", camera_id)
             return
 
-        loop = asyncio.get_event_loop()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Called from a non-async context (e.g. test harness) — fall back
+            loop = asyncio.get_event_loop()
+
         worker = StreamWorker(camera_id, rtsp_url, loop)
         self._workers[camera_id] = worker
         worker.start()
@@ -1116,6 +1345,10 @@ class DetectionEngine:
         if worker and worker.is_alive:
             return "live"
         return "offline"
+
+    def get_worker(self, camera_id: str) -> Optional[StreamWorker]:
+        """Return the active StreamWorker for a camera, if any."""
+        return self._workers.get(camera_id)
 
     def stop_all(self) -> None:
         """Gracefully stop every running stream."""

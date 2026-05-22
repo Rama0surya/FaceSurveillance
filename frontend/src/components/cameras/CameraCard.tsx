@@ -1,8 +1,13 @@
 /**
- * CameraCard — single camera entry displayed in the configuration grid.
+ * CameraCard — card component for camera list with persistent stream preview.
+ *
+ * Stream preview uses the same ref-based pattern as LiveVideoPanel:
+ * the <img> element is never unmounted by React.  Its src is changed
+ * imperatively, so the MJPEG connection only drops when the camera
+ * goes offline (not on re-renders).
  */
 
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Play,
   Square,
@@ -19,7 +24,9 @@ import AddCameraModal from './AddCameraModal';
 import DetectionZoneEditor from './DetectionZoneEditor';
 
 const API_BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
-const WS_BASE = import.meta.env.VITE_WS_URL ?? 'ws://localhost:8000';
+
+// Hard cap on retry attempts to prevent log spam
+const MAX_PREVIEW_RETRIES = 10;
 
 interface Props {
   camera: Camera;
@@ -30,7 +37,7 @@ interface Props {
   onSaveZone: (id: string, points: ZonePoint[]) => void;
 }
 
-export default function CameraCard({
+function CameraCard({
   camera,
   zonePoints,
   onUpdate,
@@ -41,49 +48,78 @@ export default function CameraCard({
   const [editOpen, setEditOpen] = useState(false);
   const [zoneOpen, setZoneOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [previewFrame, setPreviewFrame] = useState<string | null>(null);
-  const previewWsRef = useRef<WebSocket | null>(null);
+  const [previewFailed, setPreviewFailed] = useState(false);
 
-  // Preview mini WebSocket
-  // Preview mini WebSocket
-useEffect(() => {
-  if (camera.status !== 'live' && camera.status !== 'processing') {
-    setPreviewFrame(null);
-    if (previewWsRef.current) {
-      previewWsRef.current.close();
-      previewWsRef.current = null;
+  // ---- Persistent <img> ref (never unmounted by React) ----
+  const imgRef = useRef<HTMLImageElement>(null);
+  const retryCountRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ---- Connect / disconnect stream preview ----
+  const connectPreview = useCallback(() => {
+    const img = imgRef.current;
+    if (!img) return;
+
+    retryCountRef.current = 0;
+    setPreviewFailed(false);
+
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
     }
-    return;
-  }
 
-  const ws = new WebSocket(`${WS_BASE}/ws/stream/${camera.id}`);
-  previewWsRef.current = ws;
+    // Set src imperatively — element stays in DOM
+    img.src = `${API_BASE}/api/stream/video/${camera.id}`;
+  }, [camera.id]);
 
-  ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'frame' && msg.data) {
-        setPreviewFrame(msg.data);
+  const disconnectPreview = useCallback(() => {
+    const img = imgRef.current;
+    if (img) {
+      img.src = '';
+    }
+
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+
+    retryCountRef.current = 0;
+    setPreviewFailed(false);
+  }, []);
+
+  // Reset on status change
+  useEffect(() => {
+    if (camera.status === 'live') {
+      connectPreview();
+    } else {
+      disconnectPreview();
+    }
+    return () => {
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+    };
+  }, [camera.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---- MJPEG preview error handler with exponential backoff ----
+  function handlePreviewError() {
+    if (previewFailed) return;
+
+    retryCountRef.current += 1;
+
+    if (retryCountRef.current > MAX_PREVIEW_RETRIES) {
+      setPreviewFailed(true);
+      return;
+    }
+
+    const delay = Math.min(1500 * Math.pow(1.5, retryCountRef.current - 1), 10_000);
+
+    retryTimerRef.current = setTimeout(() => {
+      const img = imgRef.current;
+      if (img) {
+        // Reconnect by re-setting src (element stays mounted)
+        img.src = `${API_BASE}/api/stream/video/${camera.id}`;
       }
-    } catch { /* no-op */ }
-  };
-
-  // Only close if it's already active; otherwise, handle it gracefully
-  ws.onerror = () => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.close();
-    }
-  };
-
-  return () => {
-    // Explicitly check readyState to minimize browser console noise
-    if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN) {
-      ws.close();
-    }
-    previewWsRef.current = null;
-  };
-}, [camera.id, camera.status]);
-
+    }, delay);
+  }
 
   /* ── API helpers ──────────────────────────────────────────── */
 
@@ -147,29 +183,52 @@ useEffect(() => {
 
   const { label, dotClass, icon: StatusIcon } = statusMap[camera.status];
 
+  const shouldStream = camera.status === 'live' && !previewFailed;
+  const isConnecting = camera.status === 'processing';
+
   return (
     <>
       <div className="cam-card" id={`cam-card-${camera.id}`}>
         {/* Preview area */}
         <div className="cam-card__preview">
-          {previewFrame ? (
-            <img
-              src={`data:image/jpeg;base64,${previewFrame}`}
-              alt="preview"
-              style={{
-                width: '100%',
-                height: '100%',
-                objectFit: 'cover',
-                borderRadius: '6px 6px 0 0',
-              }}
-              draggable={false}
-            />
-          ) : (
+          {/* Persistent <img> — never unmounted by React */}
+          <img
+            ref={imgRef}
+            alt="preview"
+            onError={handlePreviewError}
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              borderRadius: '6px 6px 0 0',
+              display: shouldStream ? 'block' : 'none',
+            }}
+            draggable={false}
+          />
+
+          {/* Placeholder states */}
+          {isConnecting ? (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+              <Loader2 size={28} className="cam-card__preview-icon" style={{ animation: 'spin 1s linear infinite' }} />
+              <span className="cam-card__preview-label">Connecting to stream…</span>
+            </div>
+          ) : previewFailed ? (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+              <WifiOff size={28} className="cam-card__preview-icon" />
+              <span className="cam-card__preview-label">Stream unavailable</span>
+              <button
+                style={{ fontSize: 11, opacity: 0.7, cursor: 'pointer' }}
+                onClick={() => connectPreview()}
+              >
+                Retry
+              </button>
+            </div>
+          ) : !shouldStream ? (
             <>
               <Video size={32} className="cam-card__preview-icon" />
               <span className="cam-card__preview-label">{camera.rtsp_url}</span>
             </>
-          )}
+          ) : null}
 
           {/* Status badge */}
           <span className={`cam-card__status ${dotClass}`}>
@@ -275,3 +334,7 @@ useEffect(() => {
     </>
   );
 }
+
+// React.memo prevents re-render when parent camera list re-renders
+// for reasons unrelated to this specific camera.
+export default React.memo(CameraCard);

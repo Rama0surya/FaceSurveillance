@@ -59,25 +59,11 @@ class ConnectionManager:
         for ws in dead:
             self.disconnect_stream(camera_id, ws)
 
-    async def broadcast_frame(self, camera_id: str, frame_base64: str) -> None:
-        """Send a JPEG frame (base64) to every client watching *camera_id*.
 
-        Message format: ``{"type": "frame", "camera_id": "...", "data": "base64..."}``
-        """
-        message = {
-            "type": "frame",
-            "camera_id": camera_id,
-            "data": frame_base64,
-        }
-        payload = json.dumps(message)
-        dead: list[WebSocket] = []
-        for ws in self.stream_connections.get(camera_id, []):
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect_stream(camera_id, ws)
+    # NOTE: broadcast_frame() has been removed.
+    # The MJPEG endpoint (/api/stream/video) delivers video frames.
+    # Detection events still use broadcast_stream() below.
+
 
     # ------------------------------------------------------------------
     # Stats channel (global)

@@ -1,189 +1,98 @@
+version: '3.8'
+
 services:
-  # ------------------------------------------------------------
-  # MySQL
-  # ------------------------------------------------------------
-  mysql:
+  database:
     image: mysql:8.0
-    container_name: face_surveillance_mysql
+    container_name: fs_mysql
     restart: unless-stopped
-
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-
-    # command:
-    #   - --default-authentication-plugin=mysql_native_password
-    #   - --character-set-server=utf8mb4
-    #   - --collation-server=utf8mb4_unicode_ci
-
-    ports:
-      - "3306:3306"
-
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: face_surveillance
+      MYSQL_USER: nvruser
+      MYSQL_PASSWORD: user123
     volumes:
       - mysql_data:/var/lib/mysql
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-
-    healthcheck:
-      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost" ]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
+      - ./backend/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     networks:
-      - face-net
+      - fs_network
+    command: --innodb_flush_log_at_trx_commit=2 --sync_binlog=0
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
-  # ------------------------------------------------------------
-  # MediaMTX
-  # ------------------------------------------------------------
   mediamtx:
-    image: bluenviron/mediamtx:1.9.3
-    container_name: face_surveillance_mediamtx
+    image: bluenviron/mediamtx:latest
+    container_name: fs_mediamtx
     restart: unless-stopped
-
     ports:
       - "8554:8554"
+      - "1935:1935"
       - "8888:8888"
       - "9997:9997"
-
-    volumes:
-      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
-
     networks:
-      - face-net
+      - fs_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
-  # ------------------------------------------------------------
-  # Backend
-  # ------------------------------------------------------------
   backend:
-    build:
+    build: 
       context: ./backend
-      dockerfile: Dockerfile
-    container_name: face_surveillance_backend
+      args:
+        - USE_GPU=true
+    container_name: fs_backend
     restart: unless-stopped
-    depends_on:
-      mysql:
-        condition: service_healthy
-      mediamtx:
-        condition: service_started
-    # ports:
-    #   - "8000:8000"
-    env_file:
-      - .env
     environment:
-      ENV: development
-      API_HOST: 0.0.0.0
-      API_PORT: 8000
-      DB_HOST: mysql # ← sesuai Settings
-      DB_PORT: 3306
-      DB_USER: ${MYSQL_USER}
-      DB_PASSWORD: ${MYSQL_PASSWORD}
-      DB_NAME: ${MYSQL_DATABASE}
-
-      # --------------------------------------------------------
-      # AI Settings
-      # --------------------------------------------------------
-      FACE_DETECTOR: yolov8
-      FACE_TRACKER: bytetrack
-
-      YOLO_CONFIDENCE: 0.5
-      YOLO_MODEL_PATH: yolov8n-face-lindevs.pt
-
-      INSIGHT_MODEL: buffalo_l
-      USE_GPU: auto
-
-      # --------------------------------------------------------
-      # Snapshot
-      # --------------------------------------------------------
-      SNAPSHOT_STORAGE: local
-      SNAPSHOT_LOCAL_DIR: /app/snapshots
-
-      # --------------------------------------------------------
-      # MediaMTX
-      # --------------------------------------------------------
-      MEDIAMTX_API_URL: http://mediamtx:9997
-      MEDIAMTX_HOST: mediamtx
-      MEDIAMTX_RTSP_PORT: 8554
-      # --------------------------------------------------------
-      # CORS
-      # --------------------------------------------------------
-      CORS_ORIGINS: "*"
-
-    volumes:
-      - ./backend:/app
-      - ./snapshots:/app/snapshots
-      - insightface_models:/home/appuser/.insightface
-
-    command: >
-      sh -c " python -m pip install --no-cache-dir pymysql sqlalchemy && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload "
-
-    healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:8000/docs" ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
+      - ENV=production
+      - DATABASE_URL=mysql+aiomysql://nvruser:user123@database:3306/face_surveillance
+      - MEDIAMTX_API_URL=http://mediamtx:9997
+      - MEDIAMTX_RTSP_URL=rtsp://mediamtx:8554
+      - USE_MEDIAMTX=true
+      - SNAPSHOT_STORAGE=local
+      - USE_GPU=auto
+      - WORKERS=4
     ports:
       - "8000:8000"
+    volumes:
+      - ./backend/snapshots:/app/snapshots
+    depends_on:
+      - database
     networks:
-      - face-net
+      - fs_network
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
-  # ------------------------------------------------------------
-  # Frontend
-  # ------------------------------------------------------------
   frontend:
     build:
       context: ./frontend
-      dockerfile: Dockerfile
-
-      args:
-        VITE_API_URL: http://${HOST_IP:-localhost}:8000
-        VITE_MEDIAMTX_URL: http://${HOST_IP:-localhost}:8888
-
-    container_name: face_surveillance_frontend
-
+    container_name: fs_frontend
     restart: unless-stopped
-
-    depends_on:
-      backend:
-        condition: service_healthy
-
+    environment:
+      - VITE_API_URL=http://localhost:8000
+      - VITE_WS_URL=ws://localhost:8000
     ports:
-      - "5173:5173"
-
-    # env_file:
-    #   - ./frontend/.env
-
-    # environment:
-    #   CHOKIDAR_USEPOLLING: "true"
-
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-
-    command: npm run dev -- --host 0.0.0.0
-
+      - "5173:80"
+    depends_on:
+      - backend
     networks:
-      - face-net
+      - fs_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
-# ------------------------------------------------------------
-# Volumes
-# ------------------------------------------------------------
+networks:
+  fs_network:
+    driver: bridge
+
 volumes:
   mysql_data:
-  insightface_models:
-
-    # ------------------------------------------------------------
-    # Network
-    # ------------------------------------------------------------
-networks:
-  face-net:
-    driver: bridge

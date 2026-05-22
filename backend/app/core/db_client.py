@@ -4,7 +4,7 @@ MySQL/MariaDB client via SQLAlchemy — replaces supabase_client.py.
 from __future__ import annotations
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from app.core.config import settings
@@ -39,7 +39,7 @@ def _ensure_local_dir() -> str:
 
 
 def upload_snapshot(image_bytes: bytes, camera_id: str) -> str:
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"{camera_id}/{timestamp}_{uuid.uuid4().hex[:8]}.jpg"
     base = _ensure_local_dir()
     full_path = os.path.join(base, filename)

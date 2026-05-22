@@ -49,6 +49,15 @@ async def lifespan(app: FastAPI):
     from app.services.model_manager import model_manager
     model_manager.load_models()
 
+    # Start GPU health monitor (polls every 30s for VRAM/thermal issues)
+    from app.services.gpu_monitor import gpu_monitor
+    gpu_monitor.start()
+
+    # Start memory profiler in development mode (detect leaks during stress testing)
+    from app.services.memory_profiler import memory_profiler
+    if os.getenv("ENV", "development").lower() != "production":
+        memory_profiler.start()
+
     # Start the system-info background cache (polls every 60s)
     import asyncio
     system_info_cache.start(loop=asyncio.get_running_loop())
@@ -65,6 +74,14 @@ async def lifespan(app: FastAPI):
 
     # Cancel the stats broadcaster
     stats_broadcaster.stop()
+
+    # Stop GPU health monitor
+    from app.services.gpu_monitor import gpu_monitor
+    gpu_monitor.stop()
+
+    # Stop memory profiler
+    from app.services.memory_profiler import memory_profiler
+    memory_profiler.stop()
 
     # Stop system-info polling
     system_info_cache.stop()
@@ -109,6 +126,7 @@ from app.routes.websocket import router as ws_router           # noqa: E402
 from app.routes.debug import router as debug_router            # noqa: E402
 from app.routes.alerts import router as alerts_router          # noqa: E402
 from app.routes.settings import router as settings_router      # noqa: E402
+from app.routes.stream import router as stream_router          # noqa: E402
 
 app.include_router(cameras_router)
 app.include_router(detections_router)
@@ -116,6 +134,7 @@ app.include_router(stats_router)
 app.include_router(ws_router)
 app.include_router(alerts_router)
 app.include_router(settings_router)
+app.include_router(stream_router)
 
 # Debug routes (mock data) — only in development
 if os.getenv("ENV", "development").lower() != "production":

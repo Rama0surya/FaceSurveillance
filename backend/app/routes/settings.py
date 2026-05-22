@@ -1,5 +1,11 @@
 """
 API routes for system settings, hardware info, and runtime configuration.
+
+Refactored:
+  - Runtime detection config now writes to ``runtime_config`` (a plain
+    dataclass in ``pipeline_state``) instead of mutating Pydantic
+    ``BaseSettings`` attributes (which may be frozen in Pydantic v2).
+  - Pipeline toggles route unchanged except for SSE broadcast.
 """
 
 from __future__ import annotations
@@ -11,7 +17,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
-from app.services.pipeline_state import pipeline_state
+from app.services.pipeline_state import pipeline_state, runtime_config
 from app.services.system_info import SystemInfo, system_info_cache
 
 logger = logging.getLogger(__name__)
@@ -90,12 +96,21 @@ async def update_pipeline_toggles(body: PipelineToggleUpdate):
     if not updates:
         return pipeline_state.get_state()
 
-    return pipeline_state.update(**updates)
+    res_state = pipeline_state.update(**updates)
+
+    from app.core.sse import sse_manager
+    try:
+        await sse_manager.broadcast_global("toggle_changed", res_state)
+    except Exception:
+        logger.exception("Failed to broadcast toggle change via SSE")
+
+    return res_state
 
 
 # =====================================================================
 # Detection Config (runtime update)
 # =====================================================================
+
 class DetectionConfigUpdate(BaseModel):
     detection_interval: Optional[float] = Field(
         None, ge=0.5, le=30.0, description="Seconds between detection runs"
@@ -106,7 +121,6 @@ class DetectionConfigUpdate(BaseModel):
     deepface_model: Optional[str] = Field(
         None, description="DeepFace recognition model name"
     )
-    # ── Tambahan field baru ──
     face_detector: Optional[str] = Field(
         None, description="Detector backend: yolov8, opencv, retinaface, mtcnn, ssd"
     )
@@ -133,7 +147,12 @@ class DetectionConfigUpdate(BaseModel):
 
 @router.put("/detection-config")
 async def update_detection_config(body: DetectionConfigUpdate):
-    """Update runtime detection configuration (in-memory, not persisted to file)."""
+    """Update runtime detection configuration.
+
+    Writes to ``runtime_config`` (a mutable dataclass) instead of the
+    Pydantic ``settings`` object.  Pipeline threads read ``runtime_config``
+    on every iteration, so changes take effect immediately.
+    """
     valid_models = {"VGG-Face", "Facenet", "OpenFace", "DeepID", "ArcFace", "Dlib"}
     valid_detectors = {"yolov8", "opencv", "retinaface", "mtcnn", "ssd", "dlib"}
     valid_trackers = {"bytetrack", "botsort", "none"}
@@ -154,65 +173,52 @@ async def update_detection_config(body: DetectionConfigUpdate):
             detail=f"Invalid tracker. Choose from: {', '.join(sorted(valid_trackers))}",
         )
 
+    # ---- Apply changes to RuntimeConfig ----
+
     if body.detection_interval is not None:
-        settings.DETECTION_INTERVAL_SECONDS = body.detection_interval
-        logger.info("Updated DETECTION_INTERVAL_SECONDS → %s", body.detection_interval)
+        runtime_config.detection_interval = body.detection_interval
+        logger.info("Updated detection_interval → %s", body.detection_interval)
 
     if body.frame_fps is not None:
-        settings.FRAME_BROADCAST_FPS = body.frame_fps
-        logger.info("Updated FRAME_BROADCAST_FPS → %s", body.frame_fps)
+        runtime_config.frame_fps = body.frame_fps
+        logger.info("Updated frame_fps → %s", body.frame_fps)
 
     if body.deepface_model is not None:
-        settings.DEEPFACE_MODEL = body.deepface_model
-        logger.info("Updated DEEPFACE_MODEL → %s", body.deepface_model)
+        runtime_config.deepface_model = body.deepface_model
+        logger.info("Updated deepface_model → %s", body.deepface_model)
 
-    # if body.face_detector is not None:
-    #     settings.FACE_DETECTOR = body.face_detector
-    #     logger.info("Updated FACE_DETECTOR → %s", body.face_detector)
-    # Di backend/app/routes/settings.py, setelah validasi face_detector:
     if body.face_detector is not None:
-    # Normalize "yolo" → "yolov8" untuk kompatibilitas DeepFace
+        # Normalize "yolo" → "yolov8" for DeepFace compatibility
         normalized = "yolov8" if body.face_detector == "yolo" else body.face_detector
-        settings.FACE_DETECTOR = normalized
-        logger.info("Updated FACE_DETECTOR → %s", normalized)
+        runtime_config.face_detector = normalized
+        logger.info("Updated face_detector → %s", normalized)
 
     if body.yolo_confidence is not None:
-        settings.YOLO_CONFIDENCE = body.yolo_confidence
-        logger.info("Updated YOLO_CONFIDENCE → %s", body.yolo_confidence)
+        runtime_config.yolo_confidence = body.yolo_confidence
+        logger.info("Updated yolo_confidence → %s", body.yolo_confidence)
 
     if body.face_tracker is not None:
-        settings.FACE_TRACKER = body.face_tracker
-        logger.info("Updated FACE_TRACKER → %s", body.face_tracker)
+        runtime_config.face_tracker = body.face_tracker
+        logger.info("Updated face_tracker → %s", body.face_tracker)
 
     if body.track_reanalyze_ttl is not None:
-        settings.TRACK_REANALYZE_TTL = body.track_reanalyze_ttl
-        logger.info("Updated TRACK_REANALYZE_TTL → %s", body.track_reanalyze_ttl)
+        runtime_config.track_reanalyze_ttl = body.track_reanalyze_ttl
+        logger.info("Updated track_reanalyze_ttl → %s", body.track_reanalyze_ttl)
 
     # ── Smart capture settings ──
     if body.capture_min_confidence is not None:
-        settings.CAPTURE_MIN_CONFIDENCE = body.capture_min_confidence
-        logger.info("Updated CAPTURE_MIN_CONFIDENCE → %s", body.capture_min_confidence)
+        runtime_config.capture_min_confidence = body.capture_min_confidence
+        logger.info("Updated capture_min_confidence → %s", body.capture_min_confidence)
 
     if body.min_face_size is not None:
-        settings.MIN_FACE_SIZE = body.min_face_size
-        logger.info("Updated MIN_FACE_SIZE → %s", body.min_face_size)
+        runtime_config.min_face_size = body.min_face_size
+        logger.info("Updated min_face_size → %s", body.min_face_size)
 
     if body.capture_cooldown is not None:
-        settings.CAPTURE_COOLDOWN = body.capture_cooldown
-        logger.info("Updated CAPTURE_COOLDOWN → %s", body.capture_cooldown)
+        runtime_config.capture_cooldown = body.capture_cooldown
+        logger.info("Updated capture_cooldown → %s", body.capture_cooldown)
 
-    return {
-        "detection_interval": settings.DETECTION_INTERVAL_SECONDS,
-        "frame_fps": settings.FRAME_BROADCAST_FPS,
-        "deepface_model": settings.DEEPFACE_MODEL,
-        "face_detector": settings.FACE_DETECTOR,
-        "yolo_confidence": settings.YOLO_CONFIDENCE,
-        "face_tracker": settings.FACE_TRACKER,
-        "track_reanalyze_ttl": settings.TRACK_REANALYZE_TTL,
-        "capture_min_confidence": settings.CAPTURE_MIN_CONFIDENCE,
-        "min_face_size": settings.MIN_FACE_SIZE,
-        "capture_cooldown": settings.CAPTURE_COOLDOWN,
-    }
+    return runtime_config.to_dict()
 
 
 # =====================================================================
@@ -236,4 +242,3 @@ async def health_check():
         "uptime_seconds": SystemInfo.get_uptime_seconds(),
         "version": "1.0.0",
     }
-
