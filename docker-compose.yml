@@ -54,7 +54,6 @@ services:
       - "8000:8000"
     volumes:
       - ./backend/snapshots:/app/snapshots
-      - ./models/yolov8n-face.pt:/app/yolov8n-face.pt
     depends_on:
       database:
         condition: service_healthy

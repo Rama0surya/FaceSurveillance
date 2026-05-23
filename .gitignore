@@ -39,6 +39,3 @@ mediamtx.log
 stress_test_results.json
 result.md
 diagnostic_results.json
-start_detection.py
-start_webcam_stream.bat
-stop_detection.py
