@@ -1,15 +1,13 @@
-version: '3.8'
-
 services:
   database:
     image: mysql:8.0
     container_name: fs_mysql
     restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: face_surveillance
-      MYSQL_USER: nvruser
-      MYSQL_PASSWORD: user123
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD} # Reusing your password variable
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
     volumes:
       - mysql_data:/var/lib/mysql
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -20,6 +18,12 @@ services:
       resources:
         limits:
           memory: 1G
+    healthcheck:
+      # Variables are passed to the healthcheck command
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "${DB_USER}", "-p${DB_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   mediamtx:
     image: bluenviron/mediamtx:latest
@@ -41,35 +45,21 @@ services:
     build: 
       context: ./backend
       args:
-        - USE_GPU=true
+        - USE_GPU=${USE_GPU}
     container_name: fs_backend
     restart: unless-stopped
-    environment:
-      - ENV=production
-      - DATABASE_URL=mysql+pymysql://nvruser:user123@database:3306/face_surveillance
-      - MEDIAMTX_API_URL=http://mediamtx:9997
-      - MEDIAMTX_RTSP_URL=rtsp://mediamtx:8554
-      - USE_MEDIAMTX=true
-      - SNAPSHOT_STORAGE=local
-      - USE_GPU=auto
-      - WORKERS=4
+    env_file:
+      - .env
     ports:
       - "8000:8000"
     volumes:
       - ./backend/snapshots:/app/snapshots
+      - ./models/yolov8n-face.pt:/app/yolov8n-face.pt
     depends_on:
-      - database
+      database:
+        condition: service_healthy
     networks:
       - fs_network
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
 
   frontend:
     build:
@@ -77,8 +67,9 @@ services:
     container_name: fs_frontend
     restart: unless-stopped
     environment:
-      - VITE_API_URL=http://localhost:8000
-      - VITE_WS_URL=ws://localhost:8000
+      # Injecting values into your frontend environment
+      - VITE_API_URL=http://${SERVER_IP}:8000 
+      - VITE_WS_URL=http://${SERVER_IP}:8554 
     ports:
       - "5173:5173"
     depends_on:

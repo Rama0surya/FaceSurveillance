@@ -14,16 +14,16 @@ psutil==5.9.8
 
 # YOLO + tracking
 ultralytics>=8.1.0
-lap>=0.4
+lapx>=0.5.3
 
 # InsightFace (requires C++ build tools on Windows)
 # insightface>=0.7.3
 
 # ONNX Runtime — pilih SALAH SATU:
 # GPU (butuh CUDA):
-onnxruntime-gpu>=1.17.0
+# onnxruntime-gpu>=1.17.0
 # CPU only (uncomment jika tidak ada GPU):
-# onnxruntime>=1.17.0
+onnxruntime>=1.17.0
 
 # Database
 sqlalchemy==2.0.30

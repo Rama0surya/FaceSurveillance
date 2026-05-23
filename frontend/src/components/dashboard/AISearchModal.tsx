@@ -119,7 +119,7 @@ export default function AISearchModal({ isOpen, onClose, cameraId, onSearchCompl
               borderBottom: activeTab === 'text' ? '2px solid var(--accent-blue)' : '2px solid transparent',
               display: 'flex',
               alignItems: 'center',
-              justify-content: 'center',
+              justifyContent: 'center',
               gap: '6px',
               transition: 'all 0.2s ease',
             }}
@@ -142,7 +142,7 @@ export default function AISearchModal({ isOpen, onClose, cameraId, onSearchCompl
               borderBottom: activeTab === 'image' ? '2px solid var(--accent-blue)' : '2px solid transparent',
               display: 'flex',
               alignItems: 'center',
-              justify-content: 'center',
+              justifyContent: 'center',
               gap: '6px',
               transition: 'all 0.2s ease',
             }}

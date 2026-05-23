@@ -16,7 +16,7 @@ def insert_detection(camera_id: str, faces_data: list[dict], timestamp: Optional
         db.execute(text("""
             INSERT INTO detections (id, camera_id, timestamp, faces)
             VALUES (:id, :camera_id, :timestamp, :faces)
-        """), {"id": did, "camera_id": camera_id, "timestamp": ts, "faces": json.dumps(faces_data)})
+        """), {"id": did, "camera_id": camera_id, "timestamp": ts, "faces": json.dumps(faces_data, cls=NumpyEncoder)})
         db.commit()
         return did
     except Exception:
@@ -136,6 +136,15 @@ def _parse_snapshot(row: dict) -> dict:
     if row.get("created_at"): row["created_at"] = str(row["created_at"])
     return row
 
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        return super(NumpyEncoder, self).default(obj)
 
 def search_snapshots_by_embedding(
     query_embedding: np.ndarray,

@@ -49,6 +49,9 @@ function CameraCard({
   const [zoneOpen, setZoneOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [previewFailed, setPreviewFailed] = useState(false);
+  
+  // NEW: State untuk melacak apakah frame gambar BENAR-BENAR diterima
+  const [isActuallyLive, setIsActuallyLive] = useState(false);
 
   // ---- Persistent <img> ref (never unmounted by React) ----
   const imgRef = useRef<HTMLImageElement>(null);
@@ -62,14 +65,15 @@ function CameraCard({
 
     retryCountRef.current = 0;
     setPreviewFailed(false);
+    setIsActuallyLive(false); // Reset status saat mulai reconnect
 
     if (retryTimerRef.current) {
       clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
     }
 
-    // Set src imperatively — element stays in DOM
-    img.src = `${API_BASE}/api/stream/video/${camera.id}`;
+    // Set src imperatively + Cache Buster (agar browser tidak me-load gambar error yang nyangkut di memori)
+    img.src = `${API_BASE}/api/stream/video/${camera.id}?t=${Date.now()}`;
   }, [camera.id]);
 
   const disconnectPreview = useCallback(() => {
@@ -85,6 +89,7 @@ function CameraCard({
 
     retryCountRef.current = 0;
     setPreviewFailed(false);
+    setIsActuallyLive(false); // Pastikan status mati
   }, []);
 
   // Reset on status change
@@ -99,8 +104,18 @@ function CameraCard({
     };
   }, [camera.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ---- NEW: Handler saat stream berhasil masuk ----
+  function handlePreviewLoad() {
+    // Jika gambar berhasil di-load, berarti stream benar-benar jalan
+    setIsActuallyLive(true);
+    setPreviewFailed(false);
+    retryCountRef.current = 0; // Reset counter karena berhasil
+  }
+
   // ---- MJPEG preview error handler with exponential backoff ----
   function handlePreviewError() {
+    setIsActuallyLive(false); // Segera matikan badge Live!
+    
     if (previewFailed) return;
 
     retryCountRef.current += 1;
@@ -115,8 +130,8 @@ function CameraCard({
     retryTimerRef.current = setTimeout(() => {
       const img = imgRef.current;
       if (img) {
-        // Reconnect by re-setting src (element stays mounted)
-        img.src = `${API_BASE}/api/stream/video/${camera.id}`;
+        // Reconnect dengan CACHE BUSTER agar browser benar-benar menarik ulang stream
+        img.src = `${API_BASE}/api/stream/video/${camera.id}?t=${Date.now()}`;
       }
     }, delay);
   }
@@ -175,16 +190,21 @@ function CameraCard({
 
   /* ── Status helpers ────────────────────────────────────────── */
 
-  const statusMap: Record<Camera['status'], { label: string; dotClass: string; icon: React.ElementType }> = {
-    live: { label: 'Live', dotClass: 'cam-card__dot--live', icon: Wifi },
-    processing: { label: 'Processing', dotClass: 'cam-card__dot--processing', icon: Loader2 },
-    offline: { label: 'Offline', dotClass: 'cam-card__dot--offline', icon: WifiOff },
-  };
-
-  const { label, dotClass, icon: StatusIcon } = statusMap[camera.status];
+  // Kita sesuaikan map ini untuk bereaksi terhadap isActuallyLive
+  const statusLabel = camera.status === 'live' 
+    ? (isActuallyLive ? 'Live' : 'Menghubungkan...') 
+    : camera.status === 'processing' ? 'Processing' : 'Offline';
+    
+  const StatusIcon = camera.status === 'live' && isActuallyLive 
+    ? Wifi 
+    : camera.status === 'offline' || (camera.status === 'live' && !isActuallyLive) ? WifiOff : Loader2;
+    
+  const dotClass = camera.status === 'live' && isActuallyLive
+    ? 'cam-card__dot--live'
+    : camera.status === 'offline' ? 'cam-card__dot--offline' : 'cam-card__dot--processing';
 
   const shouldStream = camera.status === 'live' && !previewFailed;
-  const isConnecting = camera.status === 'processing';
+  const isConnecting = camera.status === 'processing' || (camera.status === 'live' && !isActuallyLive && !previewFailed);
 
   return (
     <>
@@ -196,50 +216,55 @@ function CameraCard({
             ref={imgRef}
             alt="preview"
             onError={handlePreviewError}
+            onLoad={handlePreviewLoad} // NEW: Melacak ketika gambar benar-benar tayang
             style={{
               width: '100%',
               height: '100%',
               objectFit: 'cover',
               borderRadius: '6px 6px 0 0',
               display: shouldStream ? 'block' : 'none',
+              // Tambahkan filter gelap jika sedang putus tapi berusaha reconnect
+              filter: isConnecting ? 'brightness(0.5)' : 'none', 
+              transition: 'filter 0.3s ease'
             }}
             draggable={false}
           />
 
           {/* Placeholder states */}
-          {isConnecting ? (
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+          {isConnecting && !isActuallyLive ? (
+            // Layer transparan yang muncul di atas gambar beku saat sedang reconnect
+            <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, zIndex: 5 }}>
               <Loader2 size={28} className="cam-card__preview-icon" style={{ animation: 'spin 1s linear infinite' }} />
               <span className="cam-card__preview-label">Connecting to stream…</span>
             </div>
           ) : previewFailed ? (
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8 }}>
+            <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, background: 'var(--bg-card)' }}>
               <WifiOff size={28} className="cam-card__preview-icon" />
               <span className="cam-card__preview-label">Stream unavailable</span>
               <button
-                style={{ fontSize: 11, opacity: 0.7, cursor: 'pointer' }}
+                style={{ fontSize: 11, opacity: 0.7, cursor: 'pointer', background: 'transparent', border: '1px solid currentColor', padding: '4px 8px', borderRadius: '4px' }}
                 onClick={() => connectPreview()}
               >
                 Retry
               </button>
             </div>
           ) : !shouldStream ? (
-            <>
+            <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
               <Video size={32} className="cam-card__preview-icon" />
-              <span className="cam-card__preview-label">{camera.rtsp_url}</span>
-            </>
+              <span className="cam-card__preview-label" style={{maxWidth: '80%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>{camera.rtsp_url}</span>
+            </div>
           ) : null}
 
-          {/* Status badge */}
-          <span className={`cam-card__status ${dotClass}`}>
+          {/* Status badge - SEKARANG BENAR-BENAR AKURAT */}
+          <span className={`cam-card__status ${dotClass}`} style={{ zIndex: 10 }}>
             <span className="cam-card__dot" />
             <StatusIcon size={12} />
-            {label}
+            {statusLabel}
           </span>
 
           {/* Zone indicator */}
           {zonePoints.length >= 3 && (
-            <span className="cam-card__zone-badge">
+            <span className="cam-card__zone-badge" style={{ zIndex: 10 }}>
               <Crosshair size={10} />
               Zona aktif
             </span>
@@ -335,6 +360,4 @@ function CameraCard({
   );
 }
 
-// React.memo prevents re-render when parent camera list re-renders
-// for reasons unrelated to this specific camera.
 export default React.memo(CameraCard);

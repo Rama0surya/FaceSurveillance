@@ -46,5 +46,5 @@ def upload_snapshot(image_bytes: bytes, camera_id: str) -> str:
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     with open(full_path, "wb") as f:
         f.write(image_bytes)
-        base_url = os.getenv("SNAPSHOT_BASE_URL", "http://localhost:8000")
+        base_url = os.getenv("SNAPSHOT_BASE_URL", "http://${SERVER_IP}:8000")
     return f"{base_url}/snapshots/{filename}"
