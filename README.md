@@ -1,4 +1,4 @@
-# 🛡️ Face Surveillance Dashboard
+# Face Surveillance Dashboard
 
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker)
@@ -49,7 +49,7 @@ Deployment is designed to be fully automated. The MySQL database will initialize
 
 1. **Clone the repository:**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/Rama0surya/FaceSurveillance.git
    cd face-surveillance
    ```
 
