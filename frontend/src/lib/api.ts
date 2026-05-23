@@ -248,3 +248,57 @@ export async function fetchHealthCheck() {
   }>('/api/settings/health');
 }
 
+/* ------------------------------------------------------------------ */
+/* AI Search                                                          */
+/* ------------------------------------------------------------------ */
+
+export interface SearchSnapshotRow extends SnapshotRow {
+  similarity: number;
+}
+
+export async function searchSnapshotsByText(opts: {
+  query: string;
+  cameraId?: string;
+  limit?: number;
+  similarityThreshold?: number;
+}) {
+  const res = await fetch(`${API_BASE}/api/search/text`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: opts.query,
+      camera_id: opts.cameraId || undefined,
+      limit: opts.limit ?? 20,
+      similarity_threshold: opts.similarityThreshold ?? 0.15,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Text search failed ${res.status}: ${res.statusText}`);
+  }
+  return res.json() as Promise<{ data: SearchSnapshotRow[]; count: number }>;
+}
+
+export async function searchSnapshotsByImage(opts: {
+  file: File;
+  cameraId?: string;
+  limit?: number;
+  similarityThreshold?: number;
+}) {
+  const formData = new FormData();
+  formData.append('file', opts.file);
+  if (opts.cameraId) formData.append('camera_id', opts.cameraId);
+  if (opts.limit) formData.append('limit', String(opts.limit));
+  if (opts.similarityThreshold) {
+    formData.append('similarity_threshold', String(opts.similarityThreshold));
+  }
+
+  const res = await fetch(`${API_BASE}/api/search/image`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    throw new Error(`Image search failed ${res.status}: ${res.statusText}`);
+  }
+  return res.json() as Promise<{ data: SearchSnapshotRow[]; count: number }>;
+}
+

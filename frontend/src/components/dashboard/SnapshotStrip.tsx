@@ -7,8 +7,13 @@ import { useState, useEffect, useCallback } from 'react';
 import { useCameraStore } from '@/store/cameraStore';
 import { fetchSnapshots } from '@/lib/api';
 import SnapshotModal from './SnapshotModal';
+import AISearchModal from './AISearchModal';
 import type { Snapshot } from '@/store/cameraStore';
 import { Search, Calendar } from 'lucide-react';
+
+interface SearchSnapshot extends Snapshot {
+  similarity?: number;
+}
 
 type FilterKey = 'all' | 'angry' | 'sad' | 'happy' | 'fear' | 'neutral';
 
@@ -30,6 +35,11 @@ export default function SnapshotStrip() {
   const [selected, setSelected] = useState<Snapshot | null>(null);
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [loading, setLoading] = useState(false);
+
+  // AI Search states
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [searchResults, setSearchResults] = useState<SearchSnapshot[] | null>(null);
+  const [searchQueryText, setSearchQueryText] = useState<string | null>(null);
 
   /**
    * Fetch snapshots from API based on current filters.
@@ -59,6 +69,9 @@ export default function SnapshotStrip() {
             timestamp: row.timestamp,
           }));
           setSnapshots(mapped);
+          // Clear search results when date/camera changes
+          setSearchResults(null);
+          setSearchQueryText(null);
         }
       } catch {
         // API not available — keep store snapshots (from WebSocket)
@@ -77,14 +90,38 @@ export default function SnapshotStrip() {
   // Handle filter pill click
   function handleFilterClick(key: FilterKey) {
     setFilter(key);
+    if (searchResults) {
+      // If we are looking at search results, we can filter searchResults locally or reset search
+      setSearchResults(null);
+      setSearchQueryText(null);
+    }
     loadSnapshots(key);
   }
 
   // Display store snapshots (may be enriched by WebSocket in real-time)
-  const displayed =
-    filter === 'all'
-      ? storeSnapshots.slice(0, 20)
-      : storeSnapshots.filter((s) => s.emotion === filter).slice(0, 20);
+  const displayed: SearchSnapshot[] = searchResults
+    ? searchResults
+    : filter === 'all'
+    ? storeSnapshots.slice(0, 20)
+    : storeSnapshots.filter((s) => s.emotion === filter).slice(0, 20);
+
+  const handleSearchComplete = (results: any[], mode: 'text' | 'image', query: string | undefined) => {
+    const mapped: SearchSnapshot[] = results.map((row) => ({
+      id: row.id,
+      camera_id: row.camera_id ?? (activeCamera?.id || ''),
+      detection_id: row.detection_id ?? row.id,
+      url: row.url,
+      gender: row.gender,
+      emotion: row.emotion,
+      age: row.age,
+      age_group: row.age_group,
+      camera_name: row.camera_name ?? (activeCamera?.name || ''),
+      timestamp: row.timestamp,
+      similarity: row.similarity,
+    }));
+    setSearchResults(mapped);
+    setSearchQueryText(query || (mode === 'text' ? 'Text query' : 'Image query'));
+  };
 
   return (
     <>
@@ -106,18 +143,41 @@ export default function SnapshotStrip() {
               />
             </div>
 
-            {/* Search by Image (placeholder) */}
+            {/* Search by Image */}
             <button
               className="snapshot-strip__search-btn"
-              title="Search by Image (coming soon)"
+              title="Search Wajah Pintar (AI Search)"
               id="search-by-image-btn"
-              onClick={() => alert('🔍 Fitur Search by Image akan segera hadir!')}
+              onClick={() => setIsSearchOpen(true)}
+              style={{
+                background: searchQueryText ? 'var(--accent-blue)' : undefined,
+                color: searchQueryText ? 'white' : undefined,
+              }}
             >
               <Search size={13} />
-              <span>Search by Image</span>
+              <span>{searchQueryText ? 'AI Search Active' : 'AI Search'}</span>
             </button>
           </div>
         </div>
+
+        {/* Search Banner */}
+        {searchQueryText && (
+          <div className="snap-page__image-banner" style={{ margin: '10px 14px 4px' }}>
+            <span>
+              🔍 Menampilkan hasil pencarian AI untuk: <strong>"{searchQueryText}"</strong> ({displayed.length} hasil)
+            </span>
+            <button
+              className="snap-page__image-banner-close"
+              onClick={() => {
+                setSearchResults(null);
+                setSearchQueryText(null);
+                loadSnapshots(filter);
+              }}
+            >
+              Reset
+            </button>
+          </div>
+        )}
 
         {/* Filter pills */}
         <div className="snapshot-strip__filters">
@@ -152,25 +212,60 @@ export default function SnapshotStrip() {
               key={snap.id}
               className="snapshot-strip__thumb"
               onClick={() => setSelected(snap)}
-              title={`${snap.gender} · ${snap.emotion}`}
+              title={`${snap.gender} · ${snap.emotion}${snap.similarity !== undefined ? ` · Match: ${(snap.similarity * 100).toFixed(0)}%` : ''}`}
+              style={{ position: 'relative' }}
             >
               <img src={snap.url} alt="face" draggable={false} />
+              
+              {/* Emotion dot */}
               <span
                 className="snapshot-strip__emotion-dot"
                 style={{ backgroundColor: emotionColor(snap.emotion) }}
               />
+
+              {/* Similarity score overlay badge */}
+              {snap.similarity !== undefined && (
+                <span
+                  style={{
+                    position: 'absolute',
+                    bottom: '2px',
+                    left: '2px',
+                    right: '2px',
+                    background: 'rgba(37, 99, 235, 0.85)',
+                    color: 'white',
+                    fontSize: '8px',
+                    fontWeight: 700,
+                    padding: '1px 2px',
+                    borderRadius: '3px',
+                    textAlign: 'center',
+                    fontFamily: 'monospace',
+                    backdropFilter: 'blur(4px)',
+                    pointerEvents: 'none',
+                  }}
+                >
+                  {(snap.similarity * 100).toFixed(0)}%
+                </span>
+              )}
             </button>
           ))}
         </div>
       </div>
 
-      {/* Modal */}
+      {/* Detail Modal */}
       {selected && (
         <SnapshotModal
           snapshot={selected}
           onClose={() => setSelected(null)}
         />
       )}
+
+      {/* AI Search Modal */}
+      <AISearchModal
+        isOpen={isSearchOpen}
+        onClose={() => setIsSearchOpen(false)}
+        cameraId={activeCamera?.id}
+        onSearchComplete={handleSearchComplete}
+      />
     </>
   );
 }

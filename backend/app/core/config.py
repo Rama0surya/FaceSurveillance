@@ -58,6 +58,19 @@ class Settings(BaseSettings):
     MEDIAMTX_HLS_URL: str = "http://localhost:8888" 
     USE_MEDIAMTX: bool = True
 
+    # ── RTSP / Streaming Performance (adopted from CCTV AI Jaya) ──
+    READER_DECODE_FPS: int = 3              # Max decode rate for 2-phase reader (grab+retrieve)
+    BROADCAST_FPS: int = 5                  # Max MJPEG broadcast FPS to frontend
+    GRAY_FRAME_THRESHOLD: float = 5.0       # Stddev below this = corrupt/gray frame → skip
+    RTSP_RECONNECT_DELAY: int = 2           # Initial reconnect delay (seconds)
+    RTSP_RECONNECT_MAX: int = 30            # Max reconnect delay (seconds, exponential backoff cap)
+
+    # ── AI Search Settings (adopted from CCTV AI Jaya) ──
+    CLIP_ENABLED: bool = True
+    CLIP_MODEL_PRESET: str = "clip-light"   # options: clip-light (RN50), clip (ViT-B-32), clip-heavy (ViT-L-14), siglip
+    CLIP_MODEL_NAME: str = ""
+    CLIP_PRETRAINED: str = ""
+
     @property
     def DATABASE_URL(self) -> str:
         return (
@@ -65,6 +78,46 @@ class Settings(BaseSettings):
             f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
             f"?charset=utf8mb4"
         )
+
+    def get_clip_model_info(self) -> dict:
+        """Resolve CLIP model parameters based on model preset or overrides."""
+        CLIP_PRESETS = {
+            "clip-light": {
+                "model_name": "RN50",
+                "pretrained": "openai",
+                "embedding_dim": 1024,
+                "description": "CLIP RN50 — lightweight, fast CPU inference, ~150MB",
+            },
+            "clip": {
+                "model_name": "ViT-B-32",
+                "pretrained": "laion2b_s34b_b79k",
+                "embedding_dim": 512,
+                "description": "CLIP ViT-B-32 — standard speed, moderate RAM, ~300MB",
+            },
+            "clip-heavy": {
+                "model_name": "ViT-L-14",
+                "pretrained": "datacomp_xl_s13b_b90k",
+                "embedding_dim": 768,
+                "description": "CLIP ViT-L-14 — heavy, accurate, ~900MB RAM",
+            },
+            "siglip": {
+                "model_name": "ViT-SO400M-14-SigLIP-384",
+                "pretrained": "webli",
+                "embedding_dim": 1152,
+                "description": "SigLIP SO400M — most accurate, ~1.5GB RAM",
+            }
+        }
+        if self.CLIP_MODEL_NAME:
+            return {
+                "model_name": self.CLIP_MODEL_NAME,
+                "pretrained": self.CLIP_PRETRAINED,
+                "embedding_dim": None,
+                "description": f"Custom model: {self.CLIP_MODEL_NAME}",
+            }
+        preset = self.CLIP_MODEL_PRESET.lower()
+        if preset not in CLIP_PRESETS:
+            preset = "clip-light"
+        return CLIP_PRESETS[preset]
 
     class Config:
         env_file = _find_env_file()

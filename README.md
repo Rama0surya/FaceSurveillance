@@ -9,13 +9,14 @@
 > **Advanced AI-Powered CCTV Monitoring System.**  
 > Transform any standard RTSP camera into a smart surveillance network with real-time demographic and emotion analytics.
 
-## ✨ 5 Core AI Capabilities
+## ✨ 6 Core AI Capabilities
 
 1. **Real-Time Demographic Analysis** — Instantly identify faces, estimating **Age, Gender, and Emotion** directly from live camera feeds.
-2. **Automated Evidence Logging** — All detection events and face crop snapshots are automatically persisted into the database and instantly accessible via a rich interactive dashboard.
-3. **Universal Camera Integration** — Seamlessly connect any custom IP camera or NVR simply by pasting its **RTSP link**.
-4. **1-Click Production Deployment** — Launch the entire stack (AI models, Backend, Frontend, MySQL database) instantly using a single `docker compose up` command.
-5. **Enterprise-Grade Scalability** — Designed for heavy loads with GPU acceleration, multi-worker API support, and MediaMTX stream multiplexing.
+2. **AI Semantic Search (CLIP)** — Search captured faces using natural language descriptions (e.g. "man with glasses", "happy child") or image files (reverse face search).
+3. **Automated Evidence Logging** — All detection events and face crop snapshots (with CLIP embeddings) are automatically persisted into the database.
+4. **Universal Camera Integration** — Seamlessly connect any custom IP camera or NVR simply by pasting its **RTSP link**.
+5. **1-Click Production Deployment** — Launch the entire stack (AI models, Backend, Frontend, MySQL database) instantly using a single `docker compose up` command.
+6. **Enterprise-Grade Scalability** — Designed for heavy loads with GPU acceleration, multi-worker API support, and MediaMTX stream multiplexing.
 
 ---
 
@@ -25,11 +26,11 @@ The system is fully self-contained using Docker, ensuring zero external dependen
 
 | Component      | Technology                                          |
 |----------------|-----------------------------------------------------|
-| **Frontend**   | React 18, Vite, TypeScript, Tailwind CSS            |
+| **Frontend**   | React 18, Vite, TypeScript, Vanilla CSS             |
 | **Backend**    | FastAPI, Python 3.11, WebSocket (Multi-Worker)      |
-| **AI/ML Core** | YOLOv8 (Detect), ByteTrack (Track), DeepFace (Demographics) |
+| **AI/ML Core** | YOLOv8 (Detect), ByteTrack (Track), InsightFace/DeepFace (Demographics), OpenCLIP (AI Search) |
 | **Streaming**  | MediaMTX (RTSP Proxy)                               |
-| **Database**   | MySQL 8.0 (Containerized)                           |
+| **Database**   | MySQL 8.0 (Containerized) with vector indexing      |
 | **Deployment** | Docker Compose, NVIDIA Container Toolkit (GPU)      |
 
 ---
@@ -53,7 +54,7 @@ Deployment is designed to be fully automated. The MySQL database will initialize
    ```
 
 2. **Prepare the Database Schema:**
-   Ensure your database schema `init.sql` is placed inside `backend/migrations/init.sql`. Docker will automatically execute this upon first database startup.
+   Ensure the database schema file `init.sql` is present in the root directory. Docker Compose will automatically mount and execute this script upon first database startup to create all tables (cameras, detections, snapshots, alerts, settings, etc.) with the correct CLIP embedding configurations.
 
 3. **Deploy the stack:**
    ```bash

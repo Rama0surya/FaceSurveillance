@@ -64,10 +64,24 @@ import asyncio
 # base64 import removed — WS frame broadcast eliminated (MJPEG only)
 import io
 import logging
+import os
 import queue
 import threading
 import time
 import uuid
+
+# ── Suppress warning FFmpeg HEVC and set FFmpeg options (adopted from CCTV AI Jaya) ──
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+logging.getLogger("libav").setLevel(logging.ERROR)
+# Force TCP transport for stability, and analyze stream HEVC/H.265 properly
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|"
+    "analyzeduration;10000000|"
+    "probesize;10000000"
+)
+
+# Lock to serialize VideoCapture creation
+_capture_create_lock = threading.Lock()
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -222,18 +236,12 @@ class StreamWorker:
         self._loop = loop  # main asyncio event loop (for WS broadcast)
         self._stop_event = threading.Event()
 
-        # ---- Inter-thread queues ----
-        self._frame_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(
-            maxsize=max(1, settings.FRAME_QUEUE_SIZE),
-        )
+        # ---- Inter-thread queues & Shared Frame State ----
         self._analysis_queue: queue.Queue[Optional[AnalysisTask]] = queue.Queue(
             maxsize=max(1, settings.ANALYSIS_QUEUE_SIZE),
         )
-        # Broadcast queue (Thread A → Thread D) — decoupled from AI pipeline.
-        # Frontend always gets fresh frames regardless of YOLO/InsightFace latency.
-        self._broadcast_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(
-            maxsize=2,  # Small = always the freshest frame
-        )
+        self._latest_frame: Optional[np.ndarray] = None
+        self._frame_lock = threading.Lock()
 
         # ---- Thread references ----
         self._threads: list[threading.Thread] = []
@@ -289,8 +297,11 @@ class StreamWorker:
         """Spin up all three pipeline threads."""
         self._stop_event.clear()
 
+        # Initialize latest frame state
+        with self._frame_lock:
+            self._latest_frame = None
+
         # Drain any stale items from previous runs
-        self._drain_queue(self._frame_queue)
         self._drain_queue(self._analysis_queue)
 
         thread_specs = [
@@ -318,12 +329,15 @@ class StreamWorker:
         """Signal all threads to stop and wait for them to finish."""
         self._stop_event.set()
 
+        # Clean latest frame state
+        with self._frame_lock:
+            self._latest_frame = None
+
         # Inject sentinel values to unblock any thread waiting on queue.get()
-        for q in (self._frame_queue, self._analysis_queue, self._broadcast_queue):
-            try:
-                q.put_nowait(None)
-            except queue.Full:
-                pass
+        try:
+            self._analysis_queue.put_nowait(None)
+        except queue.Full:
+            pass
 
         for t in self._threads:
             if t.is_alive():
@@ -433,27 +447,12 @@ class StreamWorker:
     # =================================================================
 
     def _frame_grabber_loop(self) -> None:
-        """Thread A: Read frames from RTSP as fast as possible.
+        """Thread A: 2-Phase RTSP Reader (adopted from CCTV AI Jaya).
 
-        This thread's ONLY job is to keep the RTSP buffer drained and
-        deliver the freshest possible frame to Thread B.  It is **never**
-        blocked by AI inference.
-
-        Frame-skipping strategy:
-          If ``frame_queue`` is full, the oldest frame is silently
-          discarded and replaced with the newer one.  This guarantees
-          Thread B always processes the most recent frame.
-
-        Reconnect strategy:
-          On stream failure, retries with exponential backoff
-          (2s → 4s → 8s → … → 30s max).
-
-        Memory optimisation:
-          cv2.VideoCapture.read() returns a new buffer per call on most
-          backends.  We attempt put_nowait first; only if the queue has
-          space do we commit the frame.  If full, we drop-oldest then put.
-          No unnecessary .copy() — the frame from read() is already our
-          exclusive reference.
+        Phase A: grab() - drains the RTSP buffer at stream speed without decoding.
+                 Very cheap (~0.1ms). Must run at stream speed to avoid stale buffer.
+        Phase B: retrieve() - decodes the frame (5-15ms). Called only at the rate
+                 needed by downstream consumers (AI / broadcast), saving 8-10x CPU.
         """
         logger.info(
             "[Thread-A] Frame grabber started for camera %s (%s)",
@@ -462,76 +461,107 @@ class StreamWorker:
         update_camera_status(self.camera_id, "processing")
 
         cap: Optional[cv2.VideoCapture] = None
-        retry_delay = 2  # seconds between reconnect attempts
+        
+        # Connection retry parameters
+        retry_delay = getattr(settings, "RTSP_RECONNECT_DELAY", 2)
+        max_retry_delay = getattr(settings, "RTSP_RECONNECT_MAX", 30)
+        gray_threshold = getattr(settings, "GRAY_FRAME_THRESHOLD", 5.0)
+
+        _decode_interval = 1.0 / max(runtime_config.reader_decode_fps, 1)
+        _last_decode_at = 0.0
+        _settings_check_at = 0.0
 
         while not self._stop_event.is_set():
             try:
-                cap = cv2.VideoCapture(self.rtsp_url)
+                # Thread-safe capture creation
+                with _capture_create_lock:
+                    # Configure OpenCV/FFmpeg options
+                    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                        "rtsp_transport;tcp|"
+                        "analyzeduration;10000000|"
+                        "probesize;10000000"
+                    )
+                    cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+
                 if not cap.isOpened():
                     logger.warning(
                         "[Thread-A] Cannot open stream %s — retrying in %ds",
                         self.rtsp_url, retry_delay,
                     )
                     self._stop_event.wait(retry_delay)
-                    retry_delay = min(retry_delay * 2, 30)
+                    retry_delay = min(retry_delay * 2, max_retry_delay)
                     continue
 
                 # Stream opened successfully
                 update_camera_status(self.camera_id, "live")
-                retry_delay = 2
+                retry_delay = getattr(settings, "RTSP_RECONNECT_DELAY", 2)
                 logger.info("[Thread-A] Stream opened for camera %s", self.camera_id)
 
+                # Set buffer size and timeout properties
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                if hasattr(cv2, 'CAP_PROP_OPEN_TIMEOUT_MSEC'):
+                    cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 15000)
+                if hasattr(cv2, 'CAP_PROP_READ_TIMEOUT_MSEC'):
+                    cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 15000)
+
                 while not self._stop_event.is_set():
-                    ret, frame = cap.read()
-                    if not ret:
+                    _now = time.time()
+
+                    # Dynamic decode interval calculation based on viewers & config
+                    if _now - _settings_check_at >= 5.0:
+                        with self._mjpeg_queues_lock:
+                            has_viewers = len(self._mjpeg_queues) > 0
+                        
+                        det_interval = max(runtime_config.detection_interval, 0.1)
+                        if has_viewers:
+                            fps = max(1.0 / det_interval, runtime_config.broadcast_fps)
+                        else:
+                            fps = 1.0 / det_interval
+                        
+                        # Clamp decoder rate to [0.5, 15.0]
+                        fps = max(0.5, min(15.0, fps))
+                        _decode_interval = 1.0 / fps
+                        _settings_check_at = _now
+
+                    # Phase A: Grab frame (fast, non-decoding buffer drain)
+                    grabbed = cap.grab()
+                    if not grabbed:
                         logger.warning(
                             "[Thread-A] Lost frame from camera %s — reconnecting",
                             self.camera_id,
                         )
-                        break  # will reconnect
+                        break
 
-                    # --------------------------------------------------
-                    # Enqueue frame with frame-skipping semantics:
-                    # If queue is full, drop the oldest frame, put the new one.
-                    # cv2 read() typically gives us a unique buffer, but some
-                    # backends reuse buffers — .copy() ensures safety.
-                    # --------------------------------------------------
-                    # Single copy shared between AI queue and broadcast queue.
-                    # Both Thread B and Thread D only read the frame.
-                    frame_copy = frame.copy()
+                    # Phase B: Retrieve frame (expensive decode) only on interval
+                    if _now - _last_decode_at >= _decode_interval:
+                        ret, frame = cap.retrieve()
+                        if ret and frame is not None:
+                            # Gray frame/corrupt frame validation
+                            # Adopted from CCTV AI Jaya to prevent processing empty frames
+                            try:
+                                stddev = np.std(frame)
+                                if stddev < gray_threshold:
+                                    # Corrupt or blank frame, skip update
+                                    pass
+                                else:
+                                    with self._frame_lock:
+                                        self._latest_frame = frame.copy()
+                                    _last_decode_at = _now
+                            except Exception:
+                                # Fallback if std calculation fails
+                                with self._frame_lock:
+                                    self._latest_frame = frame.copy()
+                                _last_decode_at = _now
 
-                    # ---- Enqueue for AI (Thread B) ----
-                    try:
-                        self._frame_queue.put_nowait(frame_copy)
-                    except queue.Full:
-                        try:
-                            self._frame_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            self._frame_queue.put_nowait(frame_copy)
-                        except queue.Full:
-                            pass
-
-                    # ---- Enqueue for Broadcast (Thread D) ----
-                    try:
-                        self._broadcast_queue.put_nowait(frame_copy)
-                    except queue.Full:
-                        try:
-                            self._broadcast_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            self._broadcast_queue.put_nowait(frame_copy)
-                        except queue.Full:
-                            pass
+                    # Yield CPU so grabber thread doesn't pin a core
+                    time.sleep(0.004)
 
             except Exception:
                 logger.exception(
                     "[Thread-A] Frame grabber error (camera %s)", self.camera_id,
                 )
                 self._stop_event.wait(retry_delay)
-                retry_delay = min(retry_delay * 2, 30)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
             finally:
                 if cap is not None:
                     cap.release()
@@ -539,6 +569,8 @@ class StreamWorker:
 
         # Thread stopping
         update_camera_status(self.camera_id, "offline")
+        with self._frame_lock:
+            self._latest_frame = None
         logger.info("[Thread-A] Frame grabber stopped for camera %s", self.camera_id)
 
     # =================================================================
@@ -546,52 +578,38 @@ class StreamWorker:
     # =================================================================
 
     def _detection_loop(self) -> None:
-        """Thread B: Fast detection + tracking (AI ONLY — no broadcast).
+        """Thread B: Fast face detection + tracking (AI ONLY — no broadcast).
 
-        Pulls frames from ``frame_queue``, runs YOLOv8n-face + (optionally)
+        Reads frames from ``_latest_frame``, runs YOLOv8n-face + (optionally)
         ByteTrack, applies smart capture filters, and enqueues
         ``AnalysisTask`` for new faces.
-
-        Frame broadcast has been moved to Thread D (broadcast worker)
-        so that AI inference latency NEVER delays the frontend stream.
-
-        Toggle-aware (lock-free via pipeline_state.snapshot()):
-          - ``tracking_enabled == False`` → skip ByteTrack
-          - ``insightface_enabled == False`` → skip enqueue
         """
         from app.services.model_manager import model_manager
 
         logger.info("[Thread-B] Detector started for camera %s", self.camera_id)
 
-        # Detection throttle — prevent running YOLO on every single frame
         last_detection = 0.0
 
         while not self._stop_event.is_set():
-            # ---- Pull frame from queue ----
-            try:
-                frame = self._frame_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue  # No frame yet, check stop_event and retry
-
-            # Sentinel check (shutdown signal)
-            if frame is None:
-                break
-
             now = time.time()
-
-            # ---- Read runtime config (lock-free, GIL-atomic) ----
             detection_interval = runtime_config.detection_interval
 
-            # NOTE: Frame broadcast has been moved to Thread D.
-            # Thread B is now 100% dedicated to AI inference.
-
-            # ---- Detection interval gate ----
-            # Only run AI detection every detection_interval seconds.
+            # Throttle detection loop to configured interval
             if now - last_detection < detection_interval:
+                time.sleep(0.01)
                 continue
+
+            # Read latest frame safely
+            with self._frame_lock:
+                frame = self._latest_frame.copy() if self._latest_frame is not None else None
+
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
             last_detection = now
 
-            # ---- Dispatch to modern or legacy pipeline ----
+            # Dispatch to modern or legacy pipeline
             if model_manager.legacy_mode or self._tracker_model is None:
                 self._process_frame_legacy(frame)
             else:
@@ -606,16 +624,8 @@ class StreamWorker:
     def _broadcast_worker_loop(self) -> None:
         """Thread D: Dedicated frame broadcaster — NEVER blocked by AI.
 
-        Pulls frames from ``broadcast_queue`` (fed by Thread A) and pushes
-        JPEG-encoded frames to all MJPEG client queues.
-
-        This thread runs at the configured ``frame_fps`` rate, completely
-        independent of YOLO/InsightFace inference timing.
-
-        Why a separate thread?
-          Thread B previously handled both AI detection AND frame broadcast.
-          When YOLO takes 100ms+, the broadcast was delayed, causing visible
-          lag on the frontend.  Thread D eliminates this coupling entirely.
+        Pulls frames from ``_latest_frame`` and pushes JPEG-encoded frames
+        to all MJPEG client queues.
         """
         logger.info(
             "[Thread-D] Broadcast worker started for camera %s", self.camera_id
@@ -624,25 +634,33 @@ class StreamWorker:
         last_broadcast = 0.0
 
         while not self._stop_event.is_set():
-            # ---- Pull frame from broadcast queue ----
-            try:
-                frame = self._broadcast_queue.get(timeout=1.0)
-            except queue.Empty:
+            # Check if any MJPEG clients are connected first
+            with self._mjpeg_queues_lock:
+                has_viewers = len(self._mjpeg_queues) > 0
+
+            if not has_viewers:
+                # No viewers — sleep and check again
+                time.sleep(0.1)
                 continue
 
-            # Sentinel check (shutdown signal)
-            if frame is None:
-                break
-
             now = time.time()
+            frame_interval = 1.0 / max(runtime_config.broadcast_fps, 1)
 
-            # ---- Throttle by configured FPS ----
-            frame_interval = 1.0 / max(runtime_config.frame_fps, 1)
             if now - last_broadcast < frame_interval:
-                continue  # Too soon — skip this frame (drop-oldest semantics)
+                time.sleep(0.005)
+                continue
+
+            # Read latest frame safely
+            with self._frame_lock:
+                frame = self._latest_frame.copy() if self._latest_frame is not None else None
+
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
             last_broadcast = now
 
-            # ---- Broadcast to MJPEG clients ----
+            # Broadcast to MJPEG clients
             self._broadcast_frame(frame)
 
         logger.info(
@@ -924,6 +942,19 @@ class StreamWorker:
             # ---- Save snapshot (disk I/O — fine in background thread) ----
             snapshot_url = self._save_snapshot(task.full_frame, task.bbox)
 
+            # Generate CLIP embedding for face search (lazy-loaded if enabled)
+            embedding = None
+            if settings.CLIP_ENABLED:
+                try:
+                    from app.services.embedding_service import embedding_service
+                    pil_crop = Image.fromarray(cv2.cvtColor(task.frame_crop, cv2.COLOR_BGR2RGB))
+                    embedding = embedding_service.encode_image(pil_crop)
+                except Exception:
+                    logger.debug(
+                        "[Thread-C] Failed to generate CLIP embedding for face track_id=%s on camera %s",
+                        task.track_id, task.camera_id
+                    )
+
             face_dict = {
                 "id": str(uuid.uuid4()),
                 "track_id": task.track_id,
@@ -934,6 +965,7 @@ class StreamWorker:
                 "age": ag["age"],
                 "confidence": round(task.confidence, 2),
                 "snapshot_url": snapshot_url,
+                "embedding": embedding,
             }
 
             # Accumulate into batch
@@ -1094,6 +1126,20 @@ class StreamWorker:
             bbox = {"x": x, "y": y, "w": w, "h": h}
             snapshot_url = self._save_snapshot(frame, bbox)
 
+            embedding = None
+            if settings.CLIP_ENABLED:
+                try:
+                    from app.services.embedding_service import embedding_service
+                    # Extract face crop for CLIP embedding
+                    y1, y2 = max(0, y), min(frame.shape[0], y + h)
+                    x1, x2 = max(0, x), min(frame.shape[1], x + w)
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        pil_crop = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                        embedding = embedding_service.encode_image(pil_crop)
+                except Exception:
+                    logger.debug("[Thread-B] Failed to generate CLIP embedding in legacy pipeline")
+
             face_id = str(uuid.uuid4())
 
             face_dict = {
@@ -1105,6 +1151,7 @@ class StreamWorker:
                 "age": age_raw,
                 "confidence": round(confidence, 2) if confidence else 0.0,
                 "snapshot_url": snapshot_url,
+                "embedding": embedding,
             }
             faces_payload.append(face_dict)
 
@@ -1222,6 +1269,7 @@ class StreamWorker:
                             camera_id=self.camera_id,
                             detection_id=detection_id,
                             url=face["snapshot_url"],
+                            embedding=face.get("embedding"),
                         )
                     except Exception:
                         logger.exception("Snapshot record insert failed")

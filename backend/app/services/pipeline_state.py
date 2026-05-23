@@ -194,6 +194,8 @@ class RuntimeConfig:
     capture_min_confidence: float = 0.65
     min_face_size: int = 60
     capture_cooldown: float = 5.0
+    reader_decode_fps: int = 3
+    broadcast_fps: int = 5
 
     def to_dict(self) -> dict:
         """Return a plain dict of all config values."""
@@ -208,6 +210,8 @@ class RuntimeConfig:
             "capture_min_confidence": self.capture_min_confidence,
             "min_face_size": self.min_face_size,
             "capture_cooldown": self.capture_cooldown,
+            "reader_decode_fps": self.reader_decode_fps,
+            "broadcast_fps": self.broadcast_fps,
         }
 
 
@@ -226,6 +230,8 @@ def _create_runtime_config() -> RuntimeConfig:
         capture_min_confidence=settings.CAPTURE_MIN_CONFIDENCE,
         min_face_size=settings.MIN_FACE_SIZE,
         capture_cooldown=settings.CAPTURE_COOLDOWN,
+        reader_decode_fps=settings.READER_DECODE_FPS,
+        broadcast_fps=settings.BROADCAST_FPS,
     )
 
 

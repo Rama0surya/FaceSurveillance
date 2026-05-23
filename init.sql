@@ -63,6 +63,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
 
     url            TEXT NOT NULL,
 
+    embedding      LONGBLOB NULL,
+
     created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     INDEX idx_snap_cam (camera_id),

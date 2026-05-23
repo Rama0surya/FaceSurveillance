@@ -133,6 +133,7 @@ class ModelManager:
         self.insight_app = None         # InsightFace FaceAnalysis
         self._loaded: bool = False
         self.legacy_mode: bool = False  # True → fallback to DeepFace for everything
+        self._yolo_fp16: bool = False   # FP16 half-precision (set during load_models)
 
         # Thread lock for InsightFace inference (not inherently thread-safe)
         self._insight_lock = threading.Lock()
@@ -287,7 +288,44 @@ class ModelManager:
             if self.device == "cuda":
                 self.yolo_model.to("cuda")
 
-            logger.info("YOLOv8 model loaded from '%s' on %s", model_path, self.device)
+                # ── FP16 half-precision probe (adopted from CCTV AI Jaya) ──
+                # Half precision is ~40-60% faster on modern NVIDIA GPUs.
+                # Probe test: run a tiny inference in FP16 — if it crashes,
+                # fall back to FP32 silently.
+                try:
+                    import numpy as _np
+                    _dummy = _np.zeros((32, 32, 3), dtype=_np.uint8)
+                    self.yolo_model(
+                        _dummy, conf=0.5, verbose=False, half=True,
+                    )
+                    self._yolo_fp16 = True
+                    logger.info("YOLO FP16 half-precision: ENABLED (probe passed)")
+                except Exception as _fp16_err:
+                    self._yolo_fp16 = False
+                    logger.info(
+                        "YOLO FP16 half-precision: DISABLED (probe failed: %s)",
+                        _fp16_err,
+                    )
+            else:
+                self._yolo_fp16 = False
+
+            # ── Warmup inference (trigger JIT compilation) ──
+            # First inference is always slow due to CUDA kernel compilation.
+            # Running a dummy inference at startup ensures production frames
+            # get the compiled (fast) path from the start.
+            try:
+                import numpy as _np
+                _warmup_frame = _np.zeros((640, 640, 3), dtype=_np.uint8)
+                self.yolo_model(
+                    _warmup_frame, conf=0.5, verbose=False,
+                    half=self._yolo_fp16,
+                )
+                logger.info("YOLO warmup inference completed")
+            except Exception:
+                logger.debug("YOLO warmup inference failed (non-critical)")
+
+            logger.info("YOLOv8 model loaded from '%s' on %s (fp16=%s)",
+                         model_path, self.device, self._yolo_fp16)
         except ImportError:
             logger.warning(
                 "ultralytics not installed — falling back to legacy DeepFace pipeline"
@@ -461,8 +499,11 @@ class ModelManager:
 
             if self.device == "cuda":
                 tracker.to("cuda")
+                tracker._fp16 = self._yolo_fp16
+            else:
+                tracker._fp16 = False
 
-            logger.info("Created new YOLO tracker instance on %s", self.device)
+            logger.info("Created new YOLO tracker instance on %s (fp16=%s)", self.device, tracker._fp16)
             return tracker
         except Exception:
             logger.exception("Failed to create YOLO tracker instance")
@@ -484,7 +525,8 @@ class ModelManager:
         if conf is None:
             conf = getattr(settings, "YOLO_CONFIDENCE", 0.5)
 
-        results = self.yolo_model(frame, conf=conf, verbose=False)
+        results = self.yolo_model(frame, conf=conf, verbose=False,
+                                  half=self._yolo_fp16)
         faces = []
         for r in results:
             for box in r.boxes:
@@ -533,6 +575,7 @@ class ModelManager:
             conf=conf,
             persist=persist,
             verbose=False,
+            half=getattr(tracker_model, '_fp16', False),
         )
 
         faces = []

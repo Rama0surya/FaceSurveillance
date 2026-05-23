@@ -38,6 +38,20 @@ async def lifespan(app: FastAPI):
     # Ensure local snapshot directory exists
     os.makedirs(settings.SNAPSHOT_LOCAL_DIR, exist_ok=True)
 
+    # Auto-migration: ensure 'embedding' column exists in 'snapshots' table
+    from app.core.db_client import get_db
+    from sqlalchemy import text as sql_text
+    db = get_db()
+    try:
+        db.execute(sql_text("ALTER TABLE snapshots ADD COLUMN embedding LONGBLOB NULL"))
+        db.commit()
+        logger.info("Database migration completed (embedding column added) ✓")
+    except Exception:
+        db.rollback()
+        logger.info("Database migration check completed (embedding column already exists or skipped) ✓")
+    finally:
+        db.close()
+
     # Start the periodic stats broadcaster
     stats_broadcaster.start()
 
@@ -48,6 +62,10 @@ async def lifespan(app: FastAPI):
     # Load AI models (YOLO, InsightFace) — once at startup, shared across all workers
     from app.services.model_manager import model_manager
     model_manager.load_models()
+
+    # Load CLIP embedding service model
+    from app.services.embedding_service import embedding_service
+    embedding_service.load_model()
 
     # Start GPU health monitor (polls every 30s for VRAM/thermal issues)
     from app.services.gpu_monitor import gpu_monitor
@@ -127,6 +145,7 @@ from app.routes.debug import router as debug_router            # noqa: E402
 from app.routes.alerts import router as alerts_router          # noqa: E402
 from app.routes.settings import router as settings_router      # noqa: E402
 from app.routes.stream import router as stream_router          # noqa: E402
+from app.routes.search import router as search_router          # noqa: E402
 
 app.include_router(cameras_router)
 app.include_router(detections_router)
@@ -135,6 +154,7 @@ app.include_router(ws_router)
 app.include_router(alerts_router)
 app.include_router(settings_router)
 app.include_router(stream_router)
+app.include_router(search_router)
 
 # Debug routes (mock data) — only in development
 if os.getenv("ENV", "development").lower() != "production":

@@ -37,5 +37,5 @@ tf-keras>=2.19.0
 # Static file serving
 aiofiles>=23.0.0
 
-# Supabase (opsional, jika masih dipakai)
-# supabase==2.4.3
+# CLIP / AI Search
+open-clip-torch>=3.3.0

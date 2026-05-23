@@ -3,6 +3,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+import numpy as np
 from sqlalchemy import text
 from app.core.db_client import get_db
 
@@ -24,15 +25,16 @@ def insert_detection(camera_id: str, faces_data: list[dict], timestamp: Optional
         db.close()
 
 
-def insert_snapshot(camera_id: str, detection_id: str, url: str) -> str:
+def insert_snapshot(camera_id: str, detection_id: str, url: str, embedding: Optional[np.ndarray] = None) -> str:
     db = get_db()
     try:
         sid = str(uuid.uuid4())
+        emb_bytes = embedding.astype(np.float32).tobytes() if embedding is not None else None
         db.execute(text("""
-            INSERT INTO snapshots (id, camera_id, detection_id, url, created_at)
-            VALUES (:id, :camera_id, :detection_id, :url, :created_at)
+            INSERT INTO snapshots (id, camera_id, detection_id, url, embedding, created_at)
+            VALUES (:id, :camera_id, :detection_id, :url, :embedding, :created_at)
         """), {"id": sid, "camera_id": camera_id, "detection_id": detection_id,
-               "url": url, "created_at": datetime.now(timezone.utc).isoformat()})
+               "url": url, "embedding": emb_bytes, "created_at": datetime.now(timezone.utc).isoformat()})
         db.commit()
         return sid
     except Exception:
@@ -133,3 +135,104 @@ def _parse_detection(row: dict) -> dict:
 def _parse_snapshot(row: dict) -> dict:
     if row.get("created_at"): row["created_at"] = str(row["created_at"])
     return row
+
+
+def search_snapshots_by_embedding(
+    query_embedding: np.ndarray,
+    camera_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 20,
+    similarity_threshold: float = 0.15
+) -> list[dict]:
+    db = get_db()
+    try:
+        conds = ["embedding IS NOT NULL"]
+        params = {}
+        if camera_id:
+            conds.append("s.camera_id = :camera_id")
+            params["camera_id"] = camera_id
+        if date_from:
+            conds.append("s.created_at >= :date_from")
+            params["date_from"] = date_from
+        if date_to:
+            conds.append("s.created_at <= :date_to")
+            params["date_to"] = date_to
+
+        where = " AND ".join(conds)
+        rows = db.execute(text(f"""
+            SELECT s.id, s.url, s.created_at, s.camera_id, s.detection_id, s.embedding,
+                   c.name AS camera_name, d.faces AS faces_json, d.timestamp AS detection_timestamp
+            FROM snapshots s
+            LEFT JOIN cameras    c ON c.id = s.camera_id
+            LEFT JOIN detections d ON d.id = s.detection_id
+            WHERE {where}
+            ORDER BY s.created_at DESC
+        """), params).mappings().all()
+
+        if not rows:
+            return []
+
+        # Python-side Cosine Similarity (adopted from CCTV AI Jaya)
+        ids = []
+        urls = []
+        created_ats = []
+        camera_ids = []
+        camera_names = []
+        detection_ids = []
+        faces_jsons = []
+        detection_timestamps = []
+        embeddings = []
+
+        for row in rows:
+            emb = np.frombuffer(row["embedding"], dtype=np.float32)
+            if emb.shape[0] != query_embedding.shape[0]:
+                continue
+            ids.append(row["id"])
+            urls.append(row["url"])
+            created_ats.append(row["created_at"])
+            camera_ids.append(row["camera_id"])
+            camera_names.append(row["camera_name"] or "")
+            detection_ids.append(row["detection_id"])
+            faces_jsons.append(row["faces_json"])
+            detection_timestamps.append(row["detection_timestamp"])
+            embeddings.append(emb)
+
+        if not embeddings:
+            return []
+
+        embeddings_matrix = np.array(embeddings)
+        query_normalized = query_embedding.astype(np.float32)
+        query_norm = np.linalg.norm(query_normalized)
+        if query_norm > 0:
+            query_normalized = query_normalized / query_norm
+
+        similarities = embeddings_matrix @ query_normalized
+        scored = [(i, float(s)) for i, s in enumerate(similarities) if s >= similarity_threshold]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        scored = scored[:limit]
+
+        results = []
+        for idx, sim in scored:
+            raw = faces_jsons[idx]
+            faces = json.loads(raw) if isinstance(raw, str) else (raw or [])
+            face_info = next((f for f in faces if f.get("snapshot_url") == urls[idx]), {})
+            if not face_info and faces:
+                face_info = faces[0]
+
+            results.append({
+                "id": ids[idx],
+                "url": urls[idx],
+                "gender": face_info.get("gender", ""),
+                "emotion": face_info.get("emotion", ""),
+                "age": face_info.get("age", 0),
+                "age_group": face_info.get("age_group", ""),
+                "camera_name": camera_names[idx],
+                "camera_id": camera_ids[idx],
+                "detection_id": detection_ids[idx],
+                "timestamp": str(detection_timestamps[idx] or created_ats[idx]),
+                "similarity": round(sim, 4),
+            })
+        return results
+    finally:
+        db.close()
