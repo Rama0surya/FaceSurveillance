@@ -4,6 +4,7 @@ Face Surveillance API — main application entry point.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -23,6 +24,68 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------------
+# Auto-resume helper
+# ------------------------------------------------------------------
+
+async def _auto_resume_streams() -> None:
+    """Re-start detection for every camera that was live/processing when
+    the server last shut down.
+
+    Called during startup after all models are loaded. Cameras that were
+    'offline' are left alone — only previously-active streams are resumed.
+
+    Each camera gets a short staggered delay so we don't hammer the
+    network / CPU with simultaneous RTSP connects on a Raspberry Pi.
+    """
+    from app.db.cameras import get_cameras, update_camera_status
+    from app.routes.cameras import _probe_rtsp
+
+    try:
+        cameras = get_cameras()
+    except Exception:
+        logger.exception("Auto-resume: failed to fetch cameras from DB")
+        return
+
+    resumable = [c for c in cameras if getattr(c, "status", "offline") in ("live", "processing")]
+
+    if not resumable:
+        logger.info("Auto-resume: no cameras to resume")
+        return
+
+    logger.info("Auto-resume: resuming %d camera(s) …", len(resumable))
+
+    for i, camera in enumerate(resumable):
+        # Stagger starts by 2 s each so the Pi isn't overwhelmed
+        if i > 0:
+            await asyncio.sleep(2)
+
+        camera_id = camera.id
+        rtsp_url  = camera.rtsp_url
+        name      = camera.name
+
+        # Probe before connecting — mark offline immediately if unreachable
+        reachable, probe_msg = await _probe_rtsp(rtsp_url, timeout=5)
+        if not reachable:
+            logger.warning(
+                "Auto-resume: camera '%s' (%s) is unreachable — marking offline. %s",
+                name, camera_id, probe_msg,
+            )
+            update_camera_status(camera_id, "offline")
+            continue
+
+        try:
+            detection_engine.start_stream(camera_id, rtsp_url)
+            update_camera_status(camera_id, "processing")
+            logger.info("Auto-resume: started stream for camera '%s' (%s)", name, camera_id)
+        except Exception:
+            logger.exception(
+                "Auto-resume: failed to start stream for camera '%s' (%s)",
+                name, camera_id,
+            )
+            update_camera_status(camera_id, "offline")
 
 
 # ------------------------------------------------------------------
@@ -67,18 +130,24 @@ async def lifespan(app: FastAPI):
     from app.services.embedding_service import embedding_service
     embedding_service.load_model()
 
-    # Start GPU health monitor (polls every 30s for VRAM/thermal issues)
+    # Start GPU health monitor
     from app.services.gpu_monitor import gpu_monitor
     gpu_monitor.start()
 
-    # Start memory profiler in development mode (detect leaks during stress testing)
+    # Start memory profiler in development mode
     from app.services.memory_profiler import memory_profiler
     if os.getenv("ENV", "development").lower() != "production":
         memory_profiler.start()
 
     # Start the system-info background cache (polls every 60s)
-    import asyncio
     system_info_cache.start(loop=asyncio.get_running_loop())
+
+    # ----------------------------------------------------------------
+    # Auto-resume: restart any camera streams that were running before
+    # the last shutdown. Runs after models are loaded so workers have
+    # YOLO/InsightFace available immediately.
+    # ----------------------------------------------------------------
+    await _auto_resume_streams()
 
     logger.info("API ready ✓")
 
@@ -87,21 +156,15 @@ async def lifespan(app: FastAPI):
     # ---- Shutdown ----
     logger.info("Shutting down …")
 
-    # Stop all active camera streams
     detection_engine.stop_all()
-
-    # Cancel the stats broadcaster
     stats_broadcaster.stop()
 
-    # Stop GPU health monitor
     from app.services.gpu_monitor import gpu_monitor
     gpu_monitor.stop()
 
-    # Stop memory profiler
     from app.services.memory_profiler import memory_profiler
     memory_profiler.stop()
 
-    # Stop system-info polling
     system_info_cache.stop()
 
     logger.info("Shutdown complete ✓")
@@ -118,21 +181,33 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ------------------------------------------------------------------
 # CORS
-origins = [o.strip() for o in settings.CORS_ORIGINS.split(",")]
+# ------------------------------------------------------------------
+# Build origin list from settings + always include the known LAN IPs.
+# The previous config was broken — allow_credentials/methods/headers
+# were missing from the middleware call.
+# ------------------------------------------------------------------
+_settings_origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
+
+_extra_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:8000",
+    f"http://{os.getenv('SERVER_IP', '192.168.0.152')}:5173",
+    f"http://{os.getenv('SERVER_IP', '192.168.0.152')}:8000",
+    f"http://{os.getenv('SERVER_IP', '192.168.0.152')}:3000",
+]
+
+# Merge, deduplicate, drop empty strings
+_all_origins = list(dict.fromkeys(_settings_origins + _extra_origins))
+
 app.add_middleware(
     CORSMiddleware,
-        allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://localhost:8000",
-        "http://192.168.0.152:5173",   # ← your LAN frontend
-        "http://192.168.0.152:8000",   # ← your LAN backend (for same-origin requests)
-        "http://192.168.0.152:3000",
-        # Add your Cloudflare tunnel domain if you access via it:
-        # "https://your-tunnel.trycloudflare.com",
-    ],
-
+    allow_origins=_all_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Serve local snapshots as static files
@@ -144,7 +219,7 @@ app.mount("/snapshots", StaticFiles(directory=snapshots_dir), name="snapshots")
 # Register routers
 # ------------------------------------------------------------------
 
-from app.routes.cameras import router as cameras_router      # noqa: E402
+from app.routes.cameras import router as cameras_router        # noqa: E402
 from app.routes.detections import router as detections_router  # noqa: E402
 from app.routes.stats import router as stats_router            # noqa: E402
 from app.routes.websocket import router as ws_router           # noqa: E402
@@ -163,7 +238,6 @@ app.include_router(settings_router)
 app.include_router(stream_router)
 app.include_router(search_router)
 
-# Debug routes (mock data) — only in development
 if os.getenv("ENV", "development").lower() != "production":
     app.include_router(debug_router)
     logger.info("Debug routes enabled (development mode)")
