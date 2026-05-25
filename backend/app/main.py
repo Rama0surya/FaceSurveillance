@@ -122,10 +122,17 @@ app = FastAPI(
 origins = [o.strip() for o in settings.CORS_ORIGINS.split(",")]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+        allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://192.168.0.152:5173",   # ← your LAN frontend
+        "http://192.168.0.152:8000",   # ← your LAN backend (for same-origin requests)
+        "http://192.168.0.152:3000",
+        # Add your Cloudflare tunnel domain if you access via it:
+        # "https://your-tunnel.trycloudflare.com",
+    ],
+
 )
 
 # Serve local snapshots as static files

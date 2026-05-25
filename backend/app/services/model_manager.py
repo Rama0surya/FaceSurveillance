@@ -169,7 +169,7 @@ class ModelManager:
         When USE_GPU=cpu:
           - Force CPU (for testing/debugging only)
         """
-        forced = getattr(settings, "USE_GPU", "auto")
+        forced = getattr(settings, "USE_GPU", "false")
 
         if forced == "cpu":
             logger.info("GPU disabled by config (USE_GPU=cpu)")

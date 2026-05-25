@@ -8,19 +8,59 @@ from sqlalchemy import text
 from app.core.db_client import get_db
 
 
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles numpy types produced by InsightFace/DeepFace."""
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
+
+
+def _sanitize_faces(faces_data: list[dict]) -> list[dict]:
+    """Remove non-serializable fields (embeddings) before storing to DB.
+
+    The embedding field is a numpy array stored separately in the snapshots
+    table as LONGBLOB. Keeping it in the faces JSON would cause NumpyEncoder
+    to inline a large float array into every detection row — wasteful and
+    the source of serialization failures when NumpyEncoder isn't applied.
+
+    We strip it here and rely on the snapshots.embedding column instead.
+    """
+    sanitized = []
+    for face in faces_data:
+        clean = {k: v for k, v in face.items() if k != "embedding"}
+        sanitized.append(clean)
+    return sanitized
+
+
 def insert_detection(camera_id: str, faces_data: list[dict], timestamp: Optional[str] = None) -> str:
     db = get_db()
     try:
         did = str(uuid.uuid4())
         ts = timestamp or datetime.now(timezone.utc).isoformat()
+
+        # Sanitize first (remove numpy arrays / embedding blobs)
+        clean_faces = _sanitize_faces(faces_data)
+
+        # Always use NumpyEncoder to safely handle any remaining numpy scalars
+        # (age as np.int64, confidence as np.float32, etc.)
+        faces_json = json.dumps(clean_faces, cls=NumpyEncoder)
+
         db.execute(text("""
             INSERT INTO detections (id, camera_id, timestamp, faces)
             VALUES (:id, :camera_id, :timestamp, :faces)
-        """), {"id": did, "camera_id": camera_id, "timestamp": ts, "faces": json.dumps(faces_data, cls=NumpyEncoder)})
+        """), {"id": did, "camera_id": camera_id, "timestamp": ts, "faces": faces_json})
         db.commit()
         return did
     except Exception:
-        db.rollback(); raise
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -38,7 +78,8 @@ def insert_snapshot(camera_id: str, detection_id: str, url: str, embedding: Opti
         db.commit()
         return sid
     except Exception:
-        db.rollback(); raise
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -136,15 +177,6 @@ def _parse_snapshot(row: dict) -> dict:
     if row.get("created_at"): row["created_at"] = str(row["created_at"])
     return row
 
-class NumpyEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, np.integer):
-            return int(obj)
-        if isinstance(obj, np.floating):
-            return float(obj)
-        return super(NumpyEncoder, self).default(obj)
 
 def search_snapshots_by_embedding(
     query_embedding: np.ndarray,
@@ -182,16 +214,8 @@ def search_snapshots_by_embedding(
         if not rows:
             return []
 
-        # Python-side Cosine Similarity (adopted from CCTV AI Jaya)
-        ids = []
-        urls = []
-        created_ats = []
-        camera_ids = []
-        camera_names = []
-        detection_ids = []
-        faces_jsons = []
-        detection_timestamps = []
-        embeddings = []
+        ids, urls, created_ats, camera_ids, camera_names = [], [], [], [], []
+        detection_ids, faces_jsons, detection_timestamps, embeddings = [], [], [], []
 
         for row in rows:
             emb = np.frombuffer(row["embedding"], dtype=np.float32)

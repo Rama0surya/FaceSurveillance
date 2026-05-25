@@ -38,6 +38,29 @@ def _ensure_local_dir() -> str:
     return path
 
 
+def _get_snapshot_base_url() -> str:
+    """Build the snapshot base URL, resolving SERVER_IP if needed.
+
+    The default value "http://${SERVER_IP}:8000" uses shell-style variable
+    syntax that Python's os.getenv() does NOT expand. We resolve it
+    explicitly so snapshot URLs stored in the DB are always valid.
+    """
+    raw = os.getenv("SNAPSHOT_BASE_URL", "")
+
+    # If explicitly set and doesn't contain the un-expanded placeholder, use it
+    if raw and "${SERVER_IP}" not in raw and "$SERVER_IP" not in raw:
+        return raw.rstrip("/")
+
+    # Fall back to SERVER_IP env var (set in docker-compose via VITE_API_URL pattern)
+    server_ip = os.getenv("SERVER_IP", "")
+    if server_ip:
+        return f"http://{server_ip}:8000"
+
+    # Last resort: use the backend's own port (works for same-host access)
+    port = os.getenv("PORT", "8000")
+    return f"http://localhost:{port}"
+
+
 def upload_snapshot(image_bytes: bytes, camera_id: str) -> str:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     filename = f"{camera_id}/{timestamp}_{uuid.uuid4().hex[:8]}.jpg"
@@ -46,5 +69,6 @@ def upload_snapshot(image_bytes: bytes, camera_id: str) -> str:
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     with open(full_path, "wb") as f:
         f.write(image_bytes)
-        base_url = os.getenv("SNAPSHOT_BASE_URL", "http://${SERVER_IP}:8000")
+
+    base_url = _get_snapshot_base_url()
     return f"{base_url}/snapshots/{filename}"

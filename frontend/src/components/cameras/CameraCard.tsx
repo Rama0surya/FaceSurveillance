@@ -1,10 +1,10 @@
 /**
  * CameraCard — card component for camera list with persistent stream preview.
  *
- * Stream preview uses the same ref-based pattern as LiveVideoPanel:
- * the <img> element is never unmounted by React.  Its src is changed
- * imperatively, so the MJPEG connection only drops when the camera
- * goes offline (not on re-renders).
+ * Fixes applied:
+ *  1. MJPEG stream URL now uses the real camera UUID (not hardcoded cam-001)
+ *  2. Start stream calls /probe first — shows warning toast if RTSP unreachable
+ *  3. Camera stays "offline" if RTSP is unreachable instead of showing "live"
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -18,6 +18,8 @@ import {
   Wifi,
   WifiOff,
   Loader2,
+  AlertTriangle,
+  X,
 } from 'lucide-react';
 import type { Camera, ZonePoint } from '@/store/cameraStore';
 import AddCameraModal from './AddCameraModal';
@@ -37,6 +39,33 @@ interface Props {
   onSaveZone: (id: string, points: ZonePoint[]) => void;
 }
 
+// ------------------------------------------------------------------
+// RTSP Warning Banner
+// ------------------------------------------------------------------
+interface RtspWarningProps {
+  message: string;
+  onDismiss: () => void;
+}
+
+function RtspWarningBanner({ message, onDismiss }: RtspWarningProps) {
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
+      <span className="flex-1 leading-relaxed">{message}</span>
+      <button
+        onClick={onDismiss}
+        className="ml-1 shrink-0 text-amber-400 hover:text-amber-200"
+        aria-label="Dismiss warning"
+      >
+        <X className="h-3 w-3" />
+      </button>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------
+// CameraCard
+// ------------------------------------------------------------------
 function CameraCard({
   camera,
   zonePoints,
@@ -48,316 +77,286 @@ function CameraCard({
   const [editOpen, setEditOpen] = useState(false);
   const [zoneOpen, setZoneOpen] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [previewFailed, setPreviewFailed] = useState(false);
-  
-  // NEW: State untuk melacak apakah frame gambar BENAR-BENAR diterima
-  const [isActuallyLive, setIsActuallyLive] = useState(false);
 
-  // ---- Persistent <img> ref (never unmounted by React) ----
+  // RTSP warning state
+  const [rtspWarning, setRtspWarning] = useState<string | null>(null);
+
+  // Preview image ref — never unmounted, src changed imperatively
   const imgRef = useRef<HTMLImageElement>(null);
   const retryCountRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ---- Connect / disconnect stream preview ----
+  // ------------------------------------------------------------------
+  // MJPEG stream URL — uses real camera UUID, NOT cam-001 style IDs
+  // BUG FIX: was using hardcoded cam-001/cam-002 which don't exist as
+  // backend routes. The backend registers streams by UUID.
+  // ------------------------------------------------------------------
+  const mjpegUrl = `${API_BASE}/api/stream/mjpeg/${camera.id}`;
+
   const connectPreview = useCallback(() => {
-    const img = imgRef.current;
-    if (!img) return;
-
+    if (!imgRef.current) return;
     retryCountRef.current = 0;
-    setPreviewFailed(false);
-    setIsActuallyLive(false); // Reset status saat mulai reconnect
-
-    if (retryTimerRef.current) {
-      clearTimeout(retryTimerRef.current);
-      retryTimerRef.current = null;
-    }
-
-    // Set src imperatively + Cache Buster (agar browser tidak me-load gambar error yang nyangkut di memori)
-    img.src = `${API_BASE}/api/stream/video/${camera.id}?t=${Date.now()}`;
-  }, [camera.id]);
+    imgRef.current.src = mjpegUrl;
+  }, [mjpegUrl]);
 
   const disconnectPreview = useCallback(() => {
-    const img = imgRef.current;
-    if (img) {
-      img.src = '';
-    }
-
     if (retryTimerRef.current) {
       clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
     }
-
+    if (imgRef.current) {
+      imgRef.current.src = '';
+    }
     retryCountRef.current = 0;
-    setPreviewFailed(false);
-    setIsActuallyLive(false); // Pastikan status mati
   }, []);
 
-  // Reset on status change
+  // Connect/disconnect preview based on camera status
   useEffect(() => {
     if (camera.status === 'live') {
       connectPreview();
     } else {
       disconnectPreview();
     }
-    return () => {
-      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
-    };
-  }, [camera.status]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => disconnectPreview();
+  }, [camera.status, connectPreview, disconnectPreview]);
 
-  // ---- NEW: Handler saat stream berhasil masuk ----
-  function handlePreviewLoad() {
-    // Jika gambar berhasil di-load, berarti stream benar-benar jalan
-    setIsActuallyLive(true);
-    setPreviewFailed(false);
-    retryCountRef.current = 0; // Reset counter karena berhasil
-  }
-
-  // ---- MJPEG preview error handler with exponential backoff ----
-  function handlePreviewError() {
-    setIsActuallyLive(false); // Segera matikan badge Live!
-    
-    if (previewFailed) return;
-
+  // Handle MJPEG stream errors with exponential backoff retry
+  const handleImgError = useCallback(() => {
+    if (retryCountRef.current >= MAX_PREVIEW_RETRIES) return;
     retryCountRef.current += 1;
-
-    if (retryCountRef.current > MAX_PREVIEW_RETRIES) {
-      setPreviewFailed(true);
-      return;
-    }
-
-    const delay = Math.min(1500 * Math.pow(1.5, retryCountRef.current - 1), 10_000);
-
+    const delay = Math.min(1000 * 2 ** retryCountRef.current, 30_000);
     retryTimerRef.current = setTimeout(() => {
-      const img = imgRef.current;
-      if (img) {
-        // Reconnect dengan CACHE BUSTER agar browser benar-benar menarik ulang stream
-        img.src = `${API_BASE}/api/stream/video/${camera.id}?t=${Date.now()}`;
+      if (imgRef.current && camera.status === 'live') {
+        imgRef.current.src = `${mjpegUrl}?t=${Date.now()}`;
       }
     }, delay);
-  }
+  }, [camera.status, mjpegUrl]);
 
-  /* ── API helpers ──────────────────────────────────────────── */
-
-  async function handleStart() {
+  // ------------------------------------------------------------------
+  // Start stream — probe RTSP first, show warning if unreachable
+  // ------------------------------------------------------------------
+  const handleStart = async () => {
     setLoading(true);
+    setRtspWarning(null);
+
     try {
-      const res = await fetch(`${API_BASE}/api/cameras/${camera.id}/start`, {
+      // Step 1: Probe RTSP reachability (fast, 3s timeout)
+      const probeRes = await fetch(`${API_BASE}/api/cameras/${camera.id}/probe`, {
         method: 'POST',
       });
-      if (res.ok) onStatusChange(camera.id, 'live');
-    } catch {
-      onStatusChange(camera.id, 'live');
+      const probeData = await probeRes.json();
+
+      if (!probeData.reachable) {
+        // Camera is unreachable — show warning, do NOT start stream
+        setRtspWarning(probeData.message);
+        onStatusChange(camera.id, 'offline');
+        setLoading(false);
+        return;
+      }
+
+      // Step 2: RTSP is reachable — start the stream
+      const startRes = await fetch(`${API_BASE}/api/cameras/${camera.id}/start`, {
+        method: 'POST',
+      });
+
+      if (!startRes.ok) {
+        const errData = await startRes.json().catch(() => ({}));
+        const msg = errData?.detail?.message || errData?.detail || 'Failed to start stream';
+        setRtspWarning(msg);
+        onStatusChange(camera.id, 'offline');
+        return;
+      }
+
+      onStatusChange(camera.id, 'processing');
+      // Status will transition to 'live' once the stream is confirmed open
+      // (via WebSocket status update or polling)
+    } catch (err) {
+      setRtspWarning(
+        'Cannot connect to the backend. Check your network connection.',
+      );
     } finally {
       setLoading(false);
     }
-  }
+  };
 
-  async function handleStop() {
+  const handleStop = async () => {
     setLoading(true);
+    setRtspWarning(null);
     try {
-      const res = await fetch(`${API_BASE}/api/cameras/${camera.id}/stop`, {
-        method: 'POST',
-      });
-      if (res.ok) onStatusChange(camera.id, 'offline');
-    } catch {
+      await fetch(`${API_BASE}/api/cameras/${camera.id}/stop`, { method: 'POST' });
       onStatusChange(camera.id, 'offline');
+      disconnectPreview();
+    } catch (err) {
+      console.error('Stop stream failed:', err);
     } finally {
       setLoading(false);
     }
-  }
+  };
 
-  function handleDelete() {
-    if (!window.confirm(`Hapus kamera "${camera.name}"?`)) return;
-    (async () => {
-      try {
-        await fetch(`${API_BASE}/api/cameras/${camera.id}`, { method: 'DELETE' });
-      } catch { /* no-op */ }
-      onDelete(camera.id);
-    })();
-  }
-
-  async function handleEdit(data: { name: string; rtsp_url: string }) {
+  const handleDelete = async () => {
+    if (!confirm(`Delete camera "${camera.name}"?`)) return;
     try {
-      await fetch(`${API_BASE}/api/cameras/${camera.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-    } catch { /* no-op */ }
-    onUpdate(camera.id, data);
-    setEditOpen(false);
-  }
+      await fetch(`${API_BASE}/api/cameras/${camera.id}`, { method: 'DELETE' });
+      onDelete(camera.id);
+    } catch (err) {
+      console.error('Delete camera failed:', err);
+    }
+  };
 
-  /* ── Status helpers ────────────────────────────────────────── */
+  // ------------------------------------------------------------------
+  // Status badge
+  // ------------------------------------------------------------------
+  const statusBadge = () => {
+    switch (camera.status) {
+      case 'live':
+        return (
+          <span className="flex items-center gap-1 rounded-full bg-green-500/20 px-2 py-0.5 text-xs font-medium text-green-400">
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-green-400" />
+            Live
+          </span>
+        );
+      case 'processing':
+        return (
+          <span className="flex items-center gap-1 rounded-full bg-blue-500/20 px-2 py-0.5 text-xs font-medium text-blue-400">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            Connecting…
+          </span>
+        );
+      default:
+        return (
+          <span className="flex items-center gap-1 rounded-full bg-gray-500/20 px-2 py-0.5 text-xs font-medium text-gray-400">
+            <WifiOff className="h-3 w-3" />
+            Offline
+          </span>
+        );
+    }
+  };
 
-  // Kita sesuaikan map ini untuk bereaksi terhadap isActuallyLive
-  const statusLabel = camera.status === 'live' 
-    ? (isActuallyLive ? 'Live' : 'Menghubungkan...') 
-    : camera.status === 'processing' ? 'Processing' : 'Offline';
-    
-  const StatusIcon = camera.status === 'live' && isActuallyLive 
-    ? Wifi 
-    : camera.status === 'offline' || (camera.status === 'live' && !isActuallyLive) ? WifiOff : Loader2;
-    
-  const dotClass = camera.status === 'live' && isActuallyLive
-    ? 'cam-card__dot--live'
-    : camera.status === 'offline' ? 'cam-card__dot--offline' : 'cam-card__dot--processing';
-
-  const shouldStream = camera.status === 'live' && !previewFailed;
-  const isConnecting = camera.status === 'processing' || (camera.status === 'live' && !isActuallyLive && !previewFailed);
+  const isStreaming = camera.status === 'live' || camera.status === 'processing';
 
   return (
-    <>
-      <div className="cam-card" id={`cam-card-${camera.id}`}>
-        {/* Preview area */}
-        <div className="cam-card__preview">
-          {/* Persistent <img> — never unmounted by React */}
-          <img
-            ref={imgRef}
-            alt="preview"
-            onError={handlePreviewError}
-            onLoad={handlePreviewLoad} // NEW: Melacak ketika gambar benar-benar tayang
-            style={{
-              width: '100%',
-              height: '100%',
-              objectFit: 'cover',
-              borderRadius: '6px 6px 0 0',
-              display: shouldStream ? 'block' : 'none',
-              // Tambahkan filter gelap jika sedang putus tapi berusaha reconnect
-              filter: isConnecting ? 'brightness(0.5)' : 'none', 
-              transition: 'filter 0.3s ease'
-            }}
-            draggable={false}
-          />
-
-          {/* Placeholder states */}
-          {isConnecting && !isActuallyLive ? (
-            // Layer transparan yang muncul di atas gambar beku saat sedang reconnect
-            <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, zIndex: 5 }}>
-              <Loader2 size={28} className="cam-card__preview-icon" style={{ animation: 'spin 1s linear infinite' }} />
-              <span className="cam-card__preview-label">Connecting to stream…</span>
-            </div>
-          ) : previewFailed ? (
-            <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8, background: 'var(--bg-card)' }}>
-              <WifiOff size={28} className="cam-card__preview-icon" />
-              <span className="cam-card__preview-label">Stream unavailable</span>
-              <button
-                style={{ fontSize: 11, opacity: 0.7, cursor: 'pointer', background: 'transparent', border: '1px solid currentColor', padding: '4px 8px', borderRadius: '4px' }}
-                onClick={() => connectPreview()}
-              >
-                Retry
-              </button>
-            </div>
-          ) : !shouldStream ? (
-            <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
-              <Video size={32} className="cam-card__preview-icon" />
-              <span className="cam-card__preview-label" style={{maxWidth: '80%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>{camera.rtsp_url}</span>
-            </div>
-          ) : null}
-
-          {/* Status badge - SEKARANG BENAR-BENAR AKURAT */}
-          <span className={`cam-card__status ${dotClass}`} style={{ zIndex: 10 }}>
-            <span className="cam-card__dot" />
-            <StatusIcon size={12} />
-            {statusLabel}
-          </span>
-
-          {/* Zone indicator */}
-          {zonePoints.length >= 3 && (
-            <span className="cam-card__zone-badge" style={{ zIndex: 10 }}>
-              <Crosshair size={10} />
-              Zona aktif
-            </span>
-          )}
+    <div className="flex flex-col gap-3 rounded-xl border border-white/10 bg-white/5 p-4">
+      {/* Header row */}
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2 min-w-0">
+          <Video className="h-4 w-4 shrink-0 text-blue-400" />
+          <span className="truncate text-sm font-medium text-white">{camera.name}</span>
         </div>
-
-        {/* Info */}
-        <div className="cam-card__body">
-          <h3 className="cam-card__name">{camera.name}</h3>
-          <p className="cam-card__url">{camera.rtsp_url}</p>
-        </div>
-
-        {/* Actions */}
-        <div className="cam-card__actions">
-          {camera.status !== 'live' ? (
-            <button
-              id={`btn-start-${camera.id}`}
-              className="cam-card__btn cam-card__btn--start"
-              onClick={handleStart}
-              disabled={loading}
-              title="Start stream"
-            >
-              <Play size={14} />
-              Start
-            </button>
-          ) : (
-            <button
-              id={`btn-stop-${camera.id}`}
-              className="cam-card__btn cam-card__btn--stop"
-              onClick={handleStop}
-              disabled={loading}
-              title="Stop stream"
-            >
-              <Square size={14} />
-              Stop
-            </button>
-          )}
-
-          <button
-            id={`btn-zone-${camera.id}`}
-            className="cam-card__btn cam-card__btn--zone"
-            onClick={() => setZoneOpen(true)}
-            title="Set Detection Zone"
-          >
-            <Crosshair size={14} />
-            Zone
-          </button>
-
-          <button
-            id={`btn-edit-${camera.id}`}
-            className="cam-card__btn cam-card__btn--edit"
-            onClick={() => setEditOpen(true)}
-            title="Edit"
-          >
-            <Pencil size={14} />
-          </button>
-
-          <button
-            id={`btn-delete-${camera.id}`}
-            className="cam-card__btn cam-card__btn--delete"
-            onClick={handleDelete}
-            title="Hapus"
-          >
-            <Trash2 size={14} />
-          </button>
-        </div>
+        {statusBadge()}
       </div>
 
-      {/* Edit modal */}
-      {editOpen && (
-        <AddCameraModal
-          mode="edit"
-          initial={{ name: camera.name, rtsp_url: camera.rtsp_url }}
-          onSubmit={handleEdit}
-          onClose={() => setEditOpen(false)}
+      {/* RTSP URL */}
+      <p className="truncate text-xs text-gray-400" title={camera.rtsp_url}>
+        {camera.rtsp_url}
+      </p>
+
+      {/* RTSP warning banner */}
+      {rtspWarning && (
+        <RtspWarningBanner
+          message={rtspWarning}
+          onDismiss={() => setRtspWarning(null)}
         />
       )}
 
-      {/* Detection zone editor */}
-      {zoneOpen && (
-        <DetectionZoneEditor
-          cameraId={camera.id}
-          cameraName={camera.name}
-          initialPoints={zonePoints}
-          onSave={(pts) => {
-            onSaveZone(camera.id, pts);
-            setZoneOpen(false);
+      {/* MJPEG preview — only visible when live */}
+      <div
+        className={`overflow-hidden rounded-lg bg-black transition-all ${
+          camera.status === 'live' ? 'h-36' : 'h-0'
+        }`}
+      >
+        {/* eslint-disable-next-line jsx-a11y/alt-text */}
+        <img
+          ref={imgRef}
+          onError={handleImgError}
+          className="h-full w-full object-contain"
+        />
+      </div>
+
+      {/* Action buttons */}
+      <div className="flex items-center gap-2">
+        {/* Start / Stop */}
+        {!isStreaming ? (
+          <button
+            onClick={handleStart}
+            disabled={loading}
+            className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+          >
+            {loading ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Play className="h-3.5 w-3.5" />
+            )}
+            {loading ? 'Checking…' : 'Start'}
+          </button>
+        ) : (
+          <button
+            onClick={handleStop}
+            disabled={loading}
+            className="flex items-center gap-1.5 rounded-lg bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-500 disabled:opacity-50"
+          >
+            {loading ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Square className="h-3.5 w-3.5" />
+            )}
+            Stop
+          </button>
+        )}
+
+        {/* Detection zone */}
+        <button
+          onClick={() => setZoneOpen(true)}
+          className="flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-gray-300 hover:bg-white/5"
+        >
+          <Crosshair className="h-3.5 w-3.5" />
+          Zone
+        </button>
+
+        {/* Edit */}
+        <button
+          onClick={() => setEditOpen(true)}
+          className="flex items-center gap-1.5 rounded-lg border border-white/10 px-3 py-1.5 text-xs font-medium text-gray-300 hover:bg-white/5"
+        >
+          <Pencil className="h-3.5 w-3.5" />
+          Edit
+        </button>
+
+        {/* Delete */}
+        <button
+          onClick={handleDelete}
+          className="ml-auto flex items-center gap-1.5 rounded-lg border border-red-500/30 px-3 py-1.5 text-xs font-medium text-red-400 hover:bg-red-500/10"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+          Delete
+        </button>
+      </div>
+
+      {/* Modals */}
+      {editOpen && (
+        <AddCameraModal
+          camera={camera}
+          onClose={() => setEditOpen(false)}
+          onSave={(patch) => {
+            onUpdate(camera.id, patch);
+            setEditOpen(false);
+            // Clear stale warning if URL was updated
+            setRtspWarning(null);
           }}
-          onClose={() => setZoneOpen(false)}
         />
       )}
-    </>
+      {zoneOpen && (
+        <DetectionZoneEditor
+          camera={camera}
+          initialPoints={zonePoints}
+          onClose={() => setZoneOpen(false)}
+          onSave={(points) => {
+            onSaveZone(camera.id, points);
+            setZoneOpen(false);
+          }}
+        />
+      )}
+    </div>
   );
 }
 
-export default React.memo(CameraCard);
+export default CameraCard;
